@@ -555,7 +555,7 @@ class DualTelemetryHUD(QMainWindow):
 
         content = QHBoxLayout()
         self.panel_fc1 = TelemetryPanel("FC1 (Serial)", DEFAULT_BAUD)
-        self.panel_fc2 = TelemetryPanel("FC2 (NRF24 → Serial)", DEFAULT_BAUD)
+        self.panel_fc2 = TelemetryPanel("FC2/FC3 (NRF24 or LoRa → Serial)", DEFAULT_BAUD)
         content.addWidget(self.panel_fc1)
         content.addWidget(self.panel_fc2)
         main_layout.addLayout(content)
