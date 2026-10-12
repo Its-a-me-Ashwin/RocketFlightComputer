@@ -1,11 +1,11 @@
 // =============================================================================
-// ROCKET FLIGHT COMPUTER — FC3
+// ROCKET FLIGHT COMPUTER
 // Board: Adafruit Feather RP2040 RFM95 (inbuilt LoRa)
 // IMU: Adafruit LSM6DSOX (accel + gyro only, no magnetometer)
 // Baro: Adafruit BMP390 (BMP3XX library)
-// Telemetry: RH_RF95 LoRa 915 MHz (same 28-byte binary packet as FC1/FC2)
-// GPS: Disabled — lat/lon always 0,0 in telemetry
-// ARM/DISARM: USB Serial only (telemetry link is one-way radio)
+// Telemetry: RH_RF95 LoRa 915 MHz (28-byte binary packet)
+// GPS: UART0 on GP0 (TX) / GP1 (RX), 9600 baud — lat/lon in telemetry when fix valid; if lost, send sentinel and continue
+// ARM/DISARM: USB Serial + LoRa (half-duplex pre-boost; one-way rocket→ground from BOOST)
 // Pins: I2C SDA=2, SCL=3; LoRa CS=16, INT=21, RST=17
 //       Pyro: GP10=MAIN, GP11=DROGUE, GP12=AIRSTART
 // =============================================================================
@@ -16,6 +16,7 @@
 #include <Adafruit_BMP3XX.h>
 #include <Adafruit_LSM6DSOX.h>
 #include <RH_RF95.h>
+#include <TinyGPSPlus.h>
 #include <math.h>
 #include <limits.h>
 
@@ -34,6 +35,11 @@ struct TelemetryPacket;
 uint8_t telemetry_checksum(const TelemetryPacket &pkt);
 void send_telemetry(uint32_t now_ms);
 bool init_sensors();
+void init_radio_only();
+void handle_lora_command();
+bool is_pre_boost_state();
+void gps_setup_uart0();
+void gps_poll();
 
 static constexpr bool LED_ACTIVE_HIGH = true;
 inline void led_write(bool on) {
@@ -47,10 +53,19 @@ static constexpr uint8_t BMP_ADDR = 0x77;
 static constexpr uint8_t LSM6DSOX_ADDR = 0x6A;
 
 // ---- LoRa RFM95 (Feather inbuilt) ----
+// One radio = half-duplex only (cannot TX and RX simultaneously on the same channel).
+// "Pseudo full duplex" = time-division: e.g. FC listens in short windows while ground sends
+// queued commands in those windows — needs shared schedule (e.g. slot index in telemetry)
+// and tolerates clock drift; not implemented here — bridge repeats rare commands instead.
 static constexpr uint8_t RFM95_CS   = 16;
 static constexpr uint8_t RFM95_INT  = 21;
 static constexpr uint8_t RFM95_RST  = 17;
 static constexpr float  RF95_FREQ   = 915.0f;
+
+// ---- GPS (UART0: MCU GP0=TX, GP1=RX) ----
+static constexpr uint8_t GPS_TX_PIN = 0;
+static constexpr uint8_t GPS_RX_PIN = 1;
+static constexpr uint32_t GPS_BAUD  = 9600;
 
 // ---- Calibration / timing ----
 static constexpr uint32_t CAL_TIME_MS = 10000;
@@ -59,8 +74,8 @@ static constexpr float G0 = 9.80665f;
 static constexpr float P0_PA_FALLBACK = 101325.0f;
 
 // Pyro
-static constexpr uint8_t MAIN_PIN     = 10;
-static constexpr uint8_t DROGUE_PIN   = 11;
+static constexpr uint8_t MAIN_PIN     = 9;
+static constexpr uint8_t DROGUE_PIN   = 10;
 static constexpr uint8_t AIRSTART_PIN = 12;
 static constexpr uint32_t PYRO_PULSE_MS = 1500;
 
@@ -69,15 +84,17 @@ static constexpr float    LAUNCH_ALT_GAIN_M       = 15.0f;
 static constexpr float    LAUNCH_ANET_THRESH      = 3.0f;
 static constexpr uint32_t LAUNCH_CONFIRM_MS       = 200;
 static constexpr uint32_t MIN_TIME_AFTER_ARM_MS   = 200;
+static constexpr uint32_t INIT_AUTO_ARM_DELAY_MS  = 1000;  // 1 s in INIT then auto-arm (single-button flow)
+static constexpr uint32_t ARMED_IDLE_TIMEOUT_MS   = 300000;  // 5 min in ARMED without launch -> safe INIT (re-arm via ARM)
 static constexpr uint32_t APOGEE_MIN_MS           = 8000;
 static constexpr uint32_t APOGEE_CONFIRM_MS       = 1000;
 static constexpr float    APOGEE_VNEG_THRESH      = -4.0f;
-static constexpr uint32_t DROGUE_MIN_MS           = 9000;
-static constexpr uint32_t DROGUE_MAX_MS           = 13500;
-static constexpr float    MAIN_DEPLOY_ALT_M       = 150.0f;
-static constexpr uint32_t MAIN_MIN_MS             = 13500;
-static constexpr uint32_t MAIN_MAX_MS             = 90000;
-static constexpr bool     AIRSTART_ENABLED        = true;
+static constexpr uint32_t DROGUE_MIN_MS           = 10000;
+static constexpr uint32_t DROGUE_MAX_MS           = 17000;
+static constexpr float    MAIN_DEPLOY_ALT_M       = 200.0f;
+static constexpr uint32_t MAIN_MIN_MS             = 18000;
+static constexpr uint32_t MAIN_MAX_MS             = 40000;
+static constexpr bool     AIRSTART_ENABLED        = false;
 static constexpr uint32_t AIRSTART_MS_AFTER_LAUNCH = 3000;
 static constexpr uint32_t GROUND_BARO_STABLE_MS   = 30000;
 static constexpr float    GROUND_BARO_THRESH_PA   = 15.0f;
@@ -95,6 +112,7 @@ static constexpr float ACCEL_TRUST_THRESH = 2.0f;
 Adafruit_BMP3XX bmp;
 Adafruit_LSM6DSOX imu;
 RH_RF95 rf95(RFM95_CS, RFM95_INT);
+TinyGPSPlus gps;
 
 // ---------------- BASELINES ----------------
 bool calibrated = false;
@@ -119,6 +137,7 @@ enum class FlightState : uint8_t {
 FlightState flight_state = FlightState::READY;
 bool start_calibration_requested = false;
 bool armed = false;
+bool skip_auto_arm = false;  // true after ARMED idle timeout: INIT waits for ARM, no 1 s auto-arm
 bool launch_detected = false;
 bool apogee_detected = false;
 uint32_t state_entry_ms = 0;
@@ -212,7 +231,36 @@ void estimator_update(uint32_t now_ms, float alt_m) {
   v_est = v_baro;
 }
 
-// ---------------- SENSOR INIT (called on START from READY) ----------------
+// ---------------- RADIO INIT (called from setup so we can receive START/ARM over LoRa before sensors) ----------------
+void init_radio_only() {
+  pinMode(RFM95_RST, OUTPUT);
+  digitalWrite(RFM95_RST, HIGH);
+  delay(10);
+  digitalWrite(RFM95_RST, LOW);
+  delay(10);
+  digitalWrite(RFM95_RST, HIGH);
+  delay(10);
+  if (!rf95.init()) {
+    Serial.println("LoRa init FAILED");
+    return;
+  }
+  if (!rf95.setFrequency(RF95_FREQ)) {
+    Serial.println("LoRa setFrequency FAILED");
+    return;
+  }
+  rf95.setTxPower(13, false);
+  rf95.setModeRx();
+  Serial.println("LoRa OK (RX for START/ARM pre-boost)");
+}
+
+bool is_pre_boost_state() {
+  return flight_state == FlightState::READY ||
+         flight_state == FlightState::CALIBRATING ||
+         flight_state == FlightState::INIT ||
+         flight_state == FlightState::ARMED;
+}
+
+// ---------------- SENSOR INIT (called on START from READY; LoRa already inited in setup) ----------------
 bool init_sensors() {
   Wire.setSDA(I2C_SDA);
   Wire.setSCL(I2C_SCL);
@@ -236,29 +284,10 @@ bool init_sensors() {
     return false;
   }
   Serial.println("OK");
-
-  Serial.print("LoRa RFM95 init... ");
-  pinMode(RFM95_RST, OUTPUT);
-  digitalWrite(RFM95_RST, HIGH);
-  delay(10);
-  digitalWrite(RFM95_RST, LOW);
-  delay(10);
-  digitalWrite(RFM95_RST, HIGH);
-  delay(10);
-  if (!rf95.init()) {
-    Serial.println("FAILED");
-    return false;
-  }
-  if (!rf95.setFrequency(RF95_FREQ)) {
-    Serial.println("setFrequency FAILED");
-    return false;
-  }
-  rf95.setTxPower(13, false);
-  Serial.println("OK");
   return true;
 }
 
-// ---------------- COMMANDS (USB Serial only) ----------------
+// ---------------- COMMANDS (USB Serial + LoRa when pre-boost) ----------------
 void handle_arm_command() {
   static char cmd_buf[16];
   static uint8_t cmd_len = 0;
@@ -275,8 +304,10 @@ void handle_arm_command() {
           start_calibration_requested = true;
         }
       } else if (strcmp(cmd_buf, "ARM") == 0) {
-        armed = true;
-        Serial.println("[CMD] ARM received (USB Serial)");
+        if (flight_state == FlightState::INIT) {
+          armed = true;
+          Serial.println("[CMD] ARM received (USB Serial)");
+        }
       } else if (strcmp(cmd_buf, "DISARM") == 0) {
         armed = false;
         Serial.println("[CMD] DISARM received (USB Serial)");
@@ -291,6 +322,44 @@ void handle_arm_command() {
   }
 }
 
+// Process START / ARM received over LoRa (only in pre-boost states)
+void handle_lora_command() {
+  if (!is_pre_boost_state()) return;
+  if (!rf95.available()) return;
+  uint8_t buf[32];
+  uint8_t len = sizeof(buf);
+  if (!rf95.recv(buf, &len)) return;
+  if (len < sizeof(buf)) buf[len] = '\0'; else buf[sizeof(buf) - 1] = '\0';
+  const char* cmd = (const char*)buf;
+  if (strcmp(cmd, "START") == 0 || strcmp(cmd, "INIT") == 0) {
+    if (flight_state == FlightState::READY) {
+      Serial.print("[CMD] ");
+      Serial.print(cmd);
+      Serial.println(" received over LoRa — begin sensor init and calibration.");
+      start_calibration_requested = true;
+    }
+  } else if (strcmp(cmd, "ARM") == 0) {
+    if (flight_state == FlightState::INIT) {
+      armed = true;
+      Serial.println("[CMD] ARM received over LoRa");
+    }
+  }
+}
+
+// ---------------- GPS (UART0 GP0/GP1; non-blocking — loss of GPS must not stop flight logic) ----------------
+void gps_setup_uart0() {
+  Serial1.setTX(GPS_TX_PIN);
+  Serial1.setRX(GPS_RX_PIN);
+  Serial1.begin(GPS_BAUD);
+}
+
+void gps_poll() {
+  // Non-blocking: only read bytes already available; if GPS disconnects, we simply get no fix
+  while (Serial1.available() > 0) {
+    gps.encode(Serial1.read());
+  }
+}
+
 // ---------------- STATE MACHINE (same as FC1/FC2) ----------------
 void update_state_machine(uint32_t now_ms, bool baro_ok, float a_net_mag, float P_pa) {
   (void)apogee_detected;
@@ -300,14 +369,29 @@ void update_state_machine(uint32_t now_ms, bool baro_ok, float a_net_mag, float 
     case FlightState::CALIBRATING:
       break;
     case FlightState::INIT:
+      // After idle timeout: skip_auto_arm — only ARM (Serial/LoRa) arms; else 1 s auto-arm
+      if (!skip_auto_arm && (now_ms - state_entry_ms) >= INIT_AUTO_ARM_DELAY_MS)
+        armed = true;
       if (armed) {
+        const bool from_idle_timeout = skip_auto_arm;
         flight_state = FlightState::ARMED;
         state_entry_ms = now_ms;
-        Serial.println("[STATE] INIT -> ARMED");
+        skip_auto_arm = false;
+        Serial.println(from_idle_timeout ? "[STATE] INIT -> ARMED (re-arm)" : "[STATE] INIT -> ARMED (auto)");
       }
       break;
     case FlightState::ARMED: {
       uint32_t t_in_state = now_ms - state_entry_ms;
+      // Pad idle: no launch for 5 min -> disarm and INIT (re-arm with ARM over LoRa/USB)
+      if (t_in_state >= ARMED_IDLE_TIMEOUT_MS) {
+        armed = false;
+        launch_trigger_start_ms = 0;
+        skip_auto_arm = true;
+        flight_state = FlightState::INIT;
+        state_entry_ms = now_ms;
+        Serial.println("[STATE] ARMED -> INIT (5 min idle — send ARM to re-arm)");
+        break;
+      }
       if (t_in_state < MIN_TIME_AFTER_ARM_MS) { launch_trigger_start_ms = 0; break; }
       float alt_gain = alt_f;
       bool alt_trigger = (baro_ok && (alt_gain >= LAUNCH_ALT_GAIN_M));
@@ -483,7 +567,7 @@ void led_update(uint32_t now_ms, LedPattern pat) {
   }
 }
 
-// ---------------- SEND TELE (FC3: LoRa, 28-byte binary packet, GPS disabled → lat/lon 0) ----------------
+// ---------------- SEND TELE (LoRa, 28-byte binary packet; GPS lat/lon when valid, else sentinel) ----------------
 void send_telemetry(uint32_t now_ms) {
   TelemetryPacket pkt{};
   pkt.preamble[0] = 'R'; pkt.preamble[1] = 'C';
@@ -493,9 +577,14 @@ void send_telemetry(uint32_t now_ms) {
   if (!isfinite(vel_mps)) vel_mps = 0.0f;
   pkt.alt_cm   = (int32_t)lroundf(alt_m * 100.0f);
   pkt.vel_cmps = (int16_t)lroundf(vel_mps * 100.0f);
-  // GPS disabled: always 0, 0
-  pkt.lat_1e7 = 0;
-  pkt.lon_1e7 = 0;
+  // GPS: send lat/lon when fix valid; if GPS lost or no fix, send sentinel (ground station shows "--")
+  if (gps.location.isValid()) {
+    pkt.lat_1e7 = (int32_t)llround(gps.location.lat() * 1e7);
+    pkt.lon_1e7 = (int32_t)llround(gps.location.lng() * 1e7);
+  } else {
+    pkt.lat_1e7 = INT32_MIN;
+    pkt.lon_1e7 = INT32_MIN;
+  }
   pkt.state = static_cast<uint8_t>(flight_state);
   int16_t rc = (int16_t)lroundf(roll_deg * 100.0f);
   int16_t pc = (int16_t)lroundf(pitch_deg * 100.0f);
@@ -509,6 +598,13 @@ void send_telemetry(uint32_t now_ms) {
   pkt.checksum = telemetry_checksum(pkt);
   rf95.send(reinterpret_cast<const uint8_t*>(&pkt), sizeof(pkt));
   rf95.waitPacketSent();
+  // From BOOST onward: one-way only (rocket → ground), no RX
+  if (flight_state != FlightState::READY && flight_state != FlightState::CALIBRATING &&
+      flight_state != FlightState::INIT && flight_state != FlightState::ARMED) {
+    rf95.setModeIdle();
+  } else {
+    rf95.setModeRx();
+  }
 }
 
 // ---------------- SETUP ----------------
@@ -517,14 +613,16 @@ void setup() {
   unsigned long t0 = millis();
   while (!Serial && millis() - t0 < 1500) delay(10);
 
-  Serial.println("\n=== FC3: BMP390 + LSM6DSOX + LoRa (915 MHz) ===");
-  Serial.println("GPS disabled — lat/lon = 0,0 in telemetry.");
-  Serial.println("State READY. Send START via USB Serial to begin init and calibration.");
-  Serial.println("ARM/DISARM via USB Serial. Telemetry is one-way LoRa.");
+  Serial.println("\n=== Rocket FC: BMP390 + LSM6DSOX + LoRa (915 MHz) + GPS (UART0 GP0/GP1) ===");
+  Serial.println("State READY. Send START via USB Serial or LoRa to begin init and calibration.");
+  Serial.println("START = 10 s cal + auto-arm 1 s; ARMED idle 5 min -> INIT (send ARM to re-arm). BOOST: one-way LoRa.");
 
   flight_state = FlightState::READY;
   calibrated = false;
   state_entry_ms = millis();
+
+  init_radio_only();
+  gps_setup_uart0();
 
   pinMode(MAIN_PIN, OUTPUT);
   pinMode(DROGUE_PIN, OUTPUT);
@@ -539,6 +637,10 @@ void setup() {
 // ---------------- LOOP ----------------
 void loop() {
   uint32_t now = millis();
+
+  // GPS poll every loop (non-blocking); if GPS is lost, we just get no fix — flight logic unchanged
+  gps_poll();
+
   LedPattern pat = pattern_for_state(calibrated, flight_state, armed);
   led_update(now, pat);
 
@@ -550,6 +652,7 @@ void loop() {
   }
 
   handle_arm_command();
+  handle_lora_command();
 
   // READY: wait for START
   if (flight_state == FlightState::READY) {
@@ -604,13 +707,14 @@ void loop() {
       pitch_deg = atan2f(-ax0, sqrtf(ay0*ay0 + az0*az0)) * 180.0f / (float)M_PI;
       yaw_deg   = 0.0f;
       last_attitude_ms = now;
+      skip_auto_arm = false;
       flight_state = FlightState::INIT;
       state_entry_ms = now;
       Serial.println("\n=== Baseline locked (t=0) ===");
       Serial.print("P0_pa="); Serial.println(P0_pa, 2);
-      Serial.println("(LSM6DSOX: no mag — yaw from gyro integration. GPS disabled.)");
+      Serial.println("(LSM6DSOX: no mag — yaw from gyro integration. GPS on UART0.)");
       Serial.println("============================\n");
-      Serial.println("Calibration done. Send ARM via USB Serial.");
+      Serial.println("Calibration done. Auto-arming in 1 s.");
     }
     delay(10);
     return;
@@ -674,5 +778,11 @@ void loop() {
     Serial.print(" | a_excess="); Serial.print(a_net_mag, 2);
     Serial.print(" | r/p/y="); Serial.print(roll_deg, 1); Serial.print(","); Serial.print(pitch_deg, 1); Serial.print(","); Serial.print(yaw_deg, 1);
   } else Serial.print(" | imu=ERR");
-  Serial.println(" | GPS=off");
+  if (gps.location.isValid()) {
+    Serial.print(" | lat="); Serial.print(gps.location.lat(), 6);
+    Serial.print(" lon="); Serial.print(gps.location.lng(), 6);
+  } else {
+    Serial.print(" | GPS=no fix");
+  }
+  Serial.println();
 }

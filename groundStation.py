@@ -168,15 +168,16 @@ class TelemetryPanel(QFrame):
         self.disconnect_btn.clicked.connect(self.disconnect)
         self.disconnect_btn.setEnabled(False)
         btn_row.addWidget(self.disconnect_btn)
-        self.start_btn = QPushButton("START")
+        self.start_btn = QPushButton("START & ARM")
         self.start_btn.clicked.connect(self.send_start_command)
         self.start_btn.setEnabled(False)
-        self.start_btn.setToolTip("Send START to begin FC init and calibration (READY → CALIBRATING)")
+        self.start_btn.setToolTip("Send START: 10 s calibration, then auto-arm after 1 s (from READY)")
         btn_row.addWidget(self.start_btn)
-        self.arm_btn = QPushButton("🔴 ARM")
-        self.arm_btn.clicked.connect(self.send_arm_command)
-        self.arm_btn.setEnabled(False)
-        btn_row.addWidget(self.arm_btn)
+        self.rearm_btn = QPushButton("RE-ARM")
+        self.rearm_btn.clicked.connect(self.send_rearm_command)
+        self.rearm_btn.setEnabled(False)
+        self.rearm_btn.setToolTip("Send ARM after FC returned to INIT from 5 min idle on pad (LoRa/USB)")
+        btn_row.addWidget(self.rearm_btn)
         layout.addLayout(btn_row)
 
         # State (big)
@@ -284,7 +285,7 @@ class TelemetryPanel(QFrame):
         self.connect_btn.setEnabled(False)
         self.disconnect_btn.setEnabled(True)
         self.start_btn.setEnabled(True)
-        self.arm_btn.setEnabled(True)
+        self.rearm_btn.setEnabled(True)
         self._stop.clear()
         self.last_packet_time = time.time()
         self.connection_lost = False
@@ -303,7 +304,7 @@ class TelemetryPanel(QFrame):
         self.connect_btn.setEnabled(True)
         self.disconnect_btn.setEnabled(False)
         self.start_btn.setEnabled(False)
-        self.arm_btn.setEnabled(False)
+        self.rearm_btn.setEnabled(False)
         self.last_packet_time = None
         self.connection_lost = True
 
@@ -425,20 +426,20 @@ class TelemetryPanel(QFrame):
         try:
             self.ser.write(b"START\n")
             if DEBUG_PRINT:
-                print(f"[{self.title}] START sent")
-            self._status_text = "START sent"
+                print(f"[{self.title}] START & ARM sent")
+            self._status_text = "START & ARM sent"
         except Exception as e:
             QMessageBox.critical(self, "Send Error", str(e))
 
-    def send_arm_command(self):
+    def send_rearm_command(self):
         if self.ser is None or not self.ser.is_open:
-            QMessageBox.critical(self, "Not Connected", f"Cannot send ARM: {self.title} not connected.")
+            QMessageBox.critical(self, "Not Connected", f"Cannot send RE-ARM: {self.title} not connected.")
             return
         try:
             self.ser.write(b"ARM\n")
             if DEBUG_PRINT:
-                print(f"[{self.title}] ARM sent")
-            self._status_text = "ARM sent"
+                print(f"[{self.title}] RE-ARM (ARM) sent")
+            self._status_text = "RE-ARM (ARM) sent"
         except Exception as e:
             QMessageBox.critical(self, "Send Error", str(e))
 
@@ -451,7 +452,7 @@ class TelemetryPanel(QFrame):
         self.status_label.setText(status_display)
         if "Error" in self._status_text:
             self.status_label.setStyleSheet("color: #a00;")
-        elif "Connected" in status_display or "Receiving" in self._status_text or "ARM sent" in self._status_text or "START sent" in self._status_text:
+        elif "Connected" in status_display or "Receiving" in self._status_text or "START" in self._status_text:
             self.status_label.setStyleSheet("color: #060;")
         else:
             self.status_label.setStyleSheet("color: #666;")
@@ -555,7 +556,7 @@ class DualTelemetryHUD(QMainWindow):
 
         content = QHBoxLayout()
         self.panel_fc1 = TelemetryPanel("FC1 (Serial)", DEFAULT_BAUD)
-        self.panel_fc2 = TelemetryPanel("FC2/FC3 (NRF24 or LoRa → Serial)", DEFAULT_BAUD)
+        self.panel_fc2 = TelemetryPanel("FC (LoRa → Serial)", DEFAULT_BAUD)
         content.addWidget(self.panel_fc1)
         content.addWidget(self.panel_fc2)
         main_layout.addLayout(content)
