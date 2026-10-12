@@ -1,8 +1,11 @@
 // =============================================================================
 // LoRa ↔ Serial bridge (Feather RP2040 RFM95 or compatible)
-// Half-duplex: Receives 28-byte telemetry from the rocket FC over LoRa and forwards to
-// USB Serial. When ground station sends START or ARM over Serial, forwards
-// that command over LoRa to the rocket (pre-boost only on FC side).
+// TDD two-way until the FC enters ARMED: receives 28-byte telemetry from the
+// rocket FC over LoRa and forwards to USB Serial; forwards any serial line
+// from the ground station (START/ARM/DISARM/SET/CFG?/SAVECFG/PING) over LoRa,
+// repeated 3x to punch through FC telemetry bursts. FC text replies (ACK/NACK/
+// CFG/PONG) are forwarded to the ground station as lines.
+// From ARMED onward the FC stops listening — telemetry flows one way only.
 // Connect this board's USB serial to the ground station at 57600.
 // Packet format: preamble "RC", time_ms, alt_cm, ...
 // =============================================================================
@@ -39,16 +42,14 @@ struct TelemetryPacket {
 
 static constexpr size_t PACKET_SIZE = sizeof(TelemetryPacket);
 
-// Command strings sent from ground station (groundStation.py sends "START\n" / "ARM\n")
-#define CMD_START  "START"
-#define CMD_ARM    "ARM"
-
+// Commands come from groundStation.py as newline-terminated lines ("START\n",
+// "ARM\n", "SET main_deploy_alt_m 250\n", ...). All are forwarded over LoRa.
 RH_RF95 rf95(RFM95_CS, RFM95_INT);
 
 uint32_t packets_forwarded = 0;
 
 // Line buffer for commands from Serial (ground station)
-static char cmd_line[32];
+static char cmd_line[64];
 static uint8_t cmd_len = 0;
 
 void send_command_over_lora(const char* cmd) {
@@ -74,11 +75,7 @@ void poll_serial_commands() {
     if (c == '\n') {
       cmd_line[cmd_len] = '\0';
       if (cmd_len > 0) {
-        if (strcmp(cmd_line, CMD_START) == 0) {
-          send_command_over_lora_reliable(CMD_START);
-        } else if (strcmp(cmd_line, CMD_ARM) == 0) {
-          send_command_over_lora_reliable(CMD_ARM);
-        }
+        send_command_over_lora_reliable(cmd_line);
         cmd_len = 0;
       }
     } else {
@@ -122,25 +119,36 @@ void setup() {
   rf95.setTxPower(10, false);
   rf95.setModeRx();
 
-  Serial.println("LoRa ready. Telemetry to Serial; START/ARM repeated 3x over LoRa for reliability.");
+  Serial.println("LoRa ready. Telemetry to Serial; any serial line forwarded 3x over LoRa (TDD until FC is ARMED).");
   Serial.print("Packet size: ");
   Serial.println(PACKET_SIZE);
 }
 
 void loop() {
-  // Forward ground station commands (START / ARM) over LoRa
+  // Forward ground station commands (any text line) over LoRa
   poll_serial_commands();
 
-  // Receive telemetry from rocket and forward to ground station
+  // Receive packets from rocket: 28-byte "RC" telemetry → raw binary to Serial;
+  // text replies (ACK/NACK/CFG/PONG) → line to Serial
   if (rf95.available()) {
     uint8_t buf[RH_RF95_MAX_MESSAGE_LEN];
     uint8_t len = sizeof(buf);
 
     if (rf95.recv(buf, &len)) {
-      if (len == PACKET_SIZE && buf[0] == 'R' && buf[1] == 'C') {
+      bool is_telemetry = (len == PACKET_SIZE && buf[0] == 'R' && buf[1] == 'C');
+      bool is_text = !is_telemetry;
+      if (is_text) {
+        for (uint8_t i = 0; i < len; i++) {
+          if (buf[i] < 0x20 || buf[i] > 0x7E) { is_text = false; break; }
+        }
+      }
+      if (is_telemetry) {
         Serial.write(buf, len);
         packets_forwarded++;
         digitalWrite(LED_BUILTIN, HIGH);
+      } else if (is_text && len > 0) {
+        Serial.write(buf, len);
+        Serial.write('\n');
       }
     }
   } else {

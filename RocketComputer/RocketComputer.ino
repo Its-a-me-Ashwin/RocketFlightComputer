@@ -5,9 +5,10 @@
 // Baro: Adafruit BMP390 (BMP3XX library)
 // Telemetry: RH_RF95 LoRa 915 MHz (28-byte binary packet)
 // GPS: UART0 on GP0 (TX) / GP1 (RX), 9600 baud — lat/lon in telemetry when fix valid; if lost, send sentinel and continue
-// ARM/DISARM: USB Serial + LoRa (half-duplex pre-boost; one-way rocket→ground from BOOST)
+// ARM/DISARM: USB Serial + LoRa (TDD two-way until ARMED; one-way rocket→ground from ARMED)
+// Settings: SET/CFG?/SAVECFG text commands over USB or LoRa (READY/INIT only), persisted to flash
 // Pins: I2C SDA=2, SCL=3; LoRa CS=16, INT=21, RST=17
-//       Pyro: GP10=MAIN, GP11=DROGUE, GP12=AIRSTART
+//       Pyro: GP9=MAIN, GP10=DROGUE, GP12=AIRSTART
 // =============================================================================
 
 #include <Wire.h>
@@ -17,8 +18,12 @@
 #include <Adafruit_LSM6DSOX.h>
 #include <RH_RF95.h>
 #include <TinyGPSPlus.h>
+#include <EEPROM.h>
 #include <math.h>
 #include <limits.h>
+#include <stdarg.h>
+#include <string.h>
+#include <stdlib.h>
 
 #ifndef LED_BUILTIN
 #define LED_BUILTIN 25
@@ -36,8 +41,11 @@ uint8_t telemetry_checksum(const TelemetryPacket &pkt);
 void send_telemetry(uint32_t now_ms);
 bool init_sensors();
 void init_radio_only();
+void handle_serial_command();
 void handle_lora_command();
-bool is_pre_boost_state();
+bool is_two_way_state();
+void load_config();
+bool save_config();
 void gps_setup_uart0();
 void gps_poll();
 
@@ -77,32 +85,159 @@ static constexpr float P0_PA_FALLBACK = 101325.0f;
 static constexpr uint8_t MAIN_PIN     = 9;
 static constexpr uint8_t DROGUE_PIN   = 10;
 static constexpr uint8_t AIRSTART_PIN = 12;
-static constexpr uint32_t PYRO_PULSE_MS = 1500;
 
-// Flight config (same as FC1/FC2)
-static constexpr float    LAUNCH_ALT_GAIN_M       = 15.0f;
-static constexpr float    LAUNCH_ANET_THRESH      = 3.0f;
-static constexpr uint32_t LAUNCH_CONFIRM_MS       = 200;
-static constexpr uint32_t MIN_TIME_AFTER_ARM_MS   = 200;
-static constexpr uint32_t INIT_AUTO_ARM_DELAY_MS  = 1000;  // 1 s in INIT then auto-arm (single-button flow)
-static constexpr uint32_t ARMED_IDLE_TIMEOUT_MS   = 300000;  // 5 min in ARMED without launch -> safe INIT (re-arm via ARM)
-static constexpr uint32_t APOGEE_MIN_MS           = 8000;
-static constexpr uint32_t APOGEE_CONFIRM_MS       = 1000;
-static constexpr float    APOGEE_VNEG_THRESH      = -4.0f;
-static constexpr uint32_t DROGUE_MIN_MS           = 10000;
-static constexpr uint32_t DROGUE_MAX_MS           = 17000;
-static constexpr float    MAIN_DEPLOY_ALT_M       = 200.0f;
-static constexpr uint32_t MAIN_MIN_MS             = 18000;
-static constexpr uint32_t MAIN_MAX_MS             = 40000;
-static constexpr bool     AIRSTART_ENABLED        = false;
-static constexpr uint32_t AIRSTART_MS_AFTER_LAUNCH = 3000;
-static constexpr uint32_t GROUND_BARO_STABLE_MS   = 30000;
-static constexpr float    GROUND_BARO_THRESH_PA   = 15.0f;
-static constexpr float    GROUND_ALT_NEAR_M       = 10.0f;
-static constexpr uint32_t GROUND_ALT_HOLD_MS      = 5000;
-static constexpr float ALT_LPF_ALPHA              = 0.05f;
-static constexpr float VBARO_LPF_ALPHA            = 0.08f;
-static constexpr float VEL_DEADBAND_MPS           = 0.3f;
+// ---------------- FLIGHT CONFIG (runtime-settable; persisted to flash) ----------------
+enum class CfgType : uint8_t { U32 = 0, F32 = 1, BOOL = 2 };
+
+struct FlightConfig {
+  float    launch_alt_gain_m;          // 15 m alt gain for launch detect
+  float    launch_anet_thresh;         // 3 m/s^2 net accel for launch detect
+  uint32_t launch_confirm_ms;          // 200
+  uint32_t min_time_after_arm_ms;      // 200
+  uint32_t armed_idle_timeout_ms;      // 300000 (5 min on pad -> back to INIT)
+  uint32_t apogee_min_ms;              // 8000
+  uint32_t apogee_confirm_ms;          // 1000
+  float    apogee_vneg_thresh;         // -4 m/s
+  uint32_t drogue_min_ms;              // 10000
+  uint32_t drogue_max_ms;              // 17000 (apogee failsafe)
+  float    main_deploy_alt_m;          // 200
+  uint32_t main_min_ms;                // 18000
+  uint32_t main_max_ms;                // 40000 (main failsafe)
+  bool     airstart_enabled;           // false
+  uint32_t airstart_ms_after_launch;   // 3000
+  uint32_t ground_baro_stable_ms;      // 30000
+  float    ground_baro_thresh_pa;      // 15
+  float    ground_alt_near_m;          // 10
+  uint32_t ground_alt_hold_ms;         // 5000
+  uint32_t pyro_pulse_ms;              // 1500
+};
+
+struct CfgKey {
+  const char* name;
+  CfgType     type;
+  uint16_t    offset;
+  float       min_val;
+  float       max_val;
+};
+
+#define CFG_KEY(field, type, lo, hi) { #field, CfgType::type, offsetof(FlightConfig, field), lo, hi }
+static const CfgKey CFG_KEYS[] = {
+  CFG_KEY(launch_alt_gain_m,          F32,  1.0f,     1000.0f),
+  CFG_KEY(launch_anet_thresh,         F32,  0.5f,     50.0f),
+  CFG_KEY(launch_confirm_ms,          U32,  50.0f,    5000.0f),
+  CFG_KEY(min_time_after_arm_ms,      U32,  0.0f,     10000.0f),
+  CFG_KEY(armed_idle_timeout_ms,      U32,  10000.0f, 3600000.0f),
+  CFG_KEY(apogee_min_ms,              U32,  0.0f,     120000.0f),
+  CFG_KEY(apogee_confirm_ms,          U32,  100.0f,   10000.0f),
+  CFG_KEY(apogee_vneg_thresh,         F32,  -50.0f,   0.0f),
+  CFG_KEY(drogue_min_ms,              U32,  0.0f,     120000.0f),
+  CFG_KEY(drogue_max_ms,              U32,  1000.0f,  300000.0f),
+  CFG_KEY(main_deploy_alt_m,          F32,  10.0f,    2000.0f),
+  CFG_KEY(main_min_ms,                U32,  0.0f,     300000.0f),
+  CFG_KEY(main_max_ms,                U32,  1000.0f,  600000.0f),
+  CFG_KEY(airstart_enabled,           BOOL, 0.0f,     1.0f),
+  CFG_KEY(airstart_ms_after_launch,   U32,  0.0f,     120000.0f),
+  CFG_KEY(ground_baro_stable_ms,      U32,  1000.0f,  300000.0f),
+  CFG_KEY(ground_baro_thresh_pa,      F32,  1.0f,     500.0f),
+  CFG_KEY(ground_alt_near_m,          F32,  1.0f,     100.0f),
+  CFG_KEY(ground_alt_hold_ms,         U32,  1000.0f,  120000.0f),
+  CFG_KEY(pyro_pulse_ms,              U32,  100.0f,   10000.0f),
+};
+static constexpr size_t CFG_KEY_COUNT = sizeof(CFG_KEYS) / sizeof(CFG_KEYS[0]);
+
+static FlightConfig default_config() {
+  FlightConfig c{};
+  c.launch_alt_gain_m = 15.0f;
+  c.launch_anet_thresh = 3.0f;
+  c.launch_confirm_ms = 200;
+  c.min_time_after_arm_ms = 200;
+  c.armed_idle_timeout_ms = 300000;
+  c.apogee_min_ms = 8000;
+  c.apogee_confirm_ms = 1000;
+  c.apogee_vneg_thresh = -4.0f;
+  c.drogue_min_ms = 10000;
+  c.drogue_max_ms = 17000;
+  c.main_deploy_alt_m = 200.0f;
+  c.main_min_ms = 18000;
+  c.main_max_ms = 40000;
+  c.airstart_enabled = false;
+  c.airstart_ms_after_launch = 3000;
+  c.ground_baro_stable_ms = 30000;
+  c.ground_baro_thresh_pa = 15.0f;
+  c.ground_alt_near_m = 10.0f;
+  c.ground_alt_hold_ms = 5000;
+  c.pyro_pulse_ms = 1500;
+  return c;
+}
+
+FlightConfig cfg = default_config();
+
+static constexpr uint32_t CFG_MAGIC = 0x52434647;  // "RCFG"
+static constexpr uint16_t CFG_VERSION = 1;
+struct ConfigSlot {
+  uint32_t     magic;
+  uint16_t     version;
+  uint16_t     crc;
+  FlightConfig c;
+};
+
+static uint16_t crc16_ccitt(const uint8_t* data, size_t len) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= (uint16_t)data[i] << 8;
+    for (uint8_t b = 0; b < 8; b++)
+      crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+  }
+  return crc;
+}
+
+void load_config() {
+  cfg = default_config();
+  EEPROM.begin(sizeof(ConfigSlot));
+  if (EEPROM.length() < (uint16_t)sizeof(ConfigSlot)) { Serial.println("[CFG] No stored config (size) — defaults"); return; }
+  ConfigSlot slot;
+  EEPROM.get(0, slot);
+  if (slot.magic != CFG_MAGIC || slot.version != CFG_VERSION) { Serial.println("[CFG] No stored config — defaults"); return; }
+  uint16_t crc = crc16_ccitt(reinterpret_cast<const uint8_t*>(&slot.c), sizeof(FlightConfig));
+  if (crc != slot.crc) { Serial.println("[CFG] Stored config CRC bad — defaults"); return; }
+  cfg = slot.c;
+  Serial.println("[CFG] Loaded config from flash");
+}
+
+bool save_config() {
+  ConfigSlot slot;
+  slot.magic = CFG_MAGIC;
+  slot.version = CFG_VERSION;
+  slot.c = cfg;
+  slot.crc = crc16_ccitt(reinterpret_cast<const uint8_t*>(&slot.c), sizeof(FlightConfig));
+  EEPROM.put(0, slot);
+  return EEPROM.commit();
+}
+
+static const CfgKey* find_cfg_key(const char* name) {
+  for (size_t i = 0; i < CFG_KEY_COUNT; i++)
+    if (strcmp(CFG_KEYS[i].name, name) == 0) return &CFG_KEYS[i];
+  return nullptr;
+}
+
+static float cfg_get_value(const CfgKey& k) {
+  const uint8_t* base = reinterpret_cast<const uint8_t*>(&cfg);
+  if (k.type == CfgType::U32)  return (float)*reinterpret_cast<const uint32_t*>(base + k.offset);
+  if (k.type == CfgType::F32)  return *reinterpret_cast<const float*>(base + k.offset);
+  return *reinterpret_cast<const bool*>(base + k.offset) ? 1.0f : 0.0f;
+}
+
+static void cfg_set_value(const CfgKey& k, float v) {
+  uint8_t* base = reinterpret_cast<uint8_t*>(&cfg);
+  if (k.type == CfgType::U32)      *reinterpret_cast<uint32_t*>(base + k.offset) = (uint32_t)v;
+  else if (k.type == CfgType::F32) *reinterpret_cast<float*>(base + k.offset) = v;
+  else                             *reinterpret_cast<bool*>(base + k.offset) = (v != 0.0f);
+}
+
+// Fixed estimator/attitude tuning (not settable from ground)
+static constexpr float ALT_LPF_ALPHA = 0.05f;
+static constexpr float VBARO_LPF_ALPHA = 0.08f;
+static constexpr float VEL_DEADBAND_MPS = 0.3f;
 
 // Attitude (complementary filter, no mag)
 static constexpr float ATTITUDE_ALPHA = 0.98f;
@@ -137,7 +272,6 @@ enum class FlightState : uint8_t {
 FlightState flight_state = FlightState::READY;
 bool start_calibration_requested = false;
 bool armed = false;
-bool skip_auto_arm = false;  // true after ARMED idle timeout: INIT waits for ARM, no 1 s auto-arm
 bool launch_detected = false;
 bool apogee_detected = false;
 uint32_t state_entry_ms = 0;
@@ -253,13 +387,155 @@ void init_radio_only() {
   Serial.println("LoRa OK (RX for START/ARM pre-boost)");
 }
 
-bool is_pre_boost_state() {
+bool is_two_way_state() {
   return flight_state == FlightState::READY ||
          flight_state == FlightState::CALIBRATING ||
-         flight_state == FlightState::INIT ||
-         flight_state == FlightState::ARMED;
+         flight_state == FlightState::INIT;
 }
 
+// ---------------- COMMAND DISPATCHER (USB Serial + LoRa, two-way states only) ----------------
+enum class ReplyChannel : uint8_t { USB = 0, LORA = 1 };
+
+static void reply_text(ReplyChannel ch, const char* msg) {
+  Serial.println(msg);
+  if (ch == ReplyChannel::LORA) {
+    rf95.send(reinterpret_cast<const uint8_t*>(msg), strlen(msg));
+    rf95.waitPacketSent();
+    if (is_two_way_state()) rf95.setModeRx(); else rf95.setModeIdle();
+  }
+}
+
+static void reply_fmt(ReplyChannel ch, const char* fmt, ...) {
+  char buf[96];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  reply_text(ch, buf);
+}
+
+static bool parse_cfg_value(const CfgKey& k, const char* s, float& out) {
+  if (k.type == CfgType::BOOL) {
+    if (strcmp(s, "1") == 0 || strcmp(s, "true") == 0 || strcmp(s, "on") == 0)  { out = 1.0f; return true; }
+    if (strcmp(s, "0") == 0 || strcmp(s, "false") == 0 || strcmp(s, "off") == 0) { out = 0.0f; return true; }
+    return false;
+  }
+  char* end = nullptr;
+  float v = (k.type == CfgType::U32) ? (float)strtoul(s, &end, 10) : strtof(s, &end);
+  if (end == s || *end != '\0') return false;
+  out = v;
+  return true;
+}
+
+static void dump_config(ReplyChannel ch) {
+  char buf[96];
+  for (size_t i = 0; i < CFG_KEY_COUNT; i++) {
+    const CfgKey& k = CFG_KEYS[i];
+    float v = cfg_get_value(k);
+    if (k.type == CfgType::F32)      snprintf(buf, sizeof(buf), "CFG %s %.3f", k.name, v);
+    else if (k.type == CfgType::U32) snprintf(buf, sizeof(buf), "CFG %s %lu", k.name, (unsigned long)v);
+    else                             snprintf(buf, sizeof(buf), "CFG %s %d", k.name, (int)v);
+    reply_text(ch, buf);
+  }
+  reply_text(ch, "CFG END");
+}
+
+void dispatch_command(char* line, ReplyChannel ch) {
+  char* save = nullptr;
+  char* cmd = strtok_r(line, " ", &save);
+
+  if (cmd == nullptr || cmd[0] == '\0') return;
+
+  if (strcmp(cmd, "START") == 0 || strcmp(cmd, "INIT") == 0) {
+    if (flight_state == FlightState::READY) {
+      start_calibration_requested = true;
+      reply_text(ch, "ACK START");
+    } else {
+      reply_fmt(ch, "NACK START STATE %s", stateToString(flight_state));
+    }
+  } else if (strcmp(cmd, "ARM") == 0) {
+    if (flight_state == FlightState::INIT) {
+      armed = true;
+      reply_text(ch, "ACK ARM");
+    } else {
+      reply_fmt(ch, "NACK ARM STATE %s", stateToString(flight_state));
+    }
+  } else if (strcmp(cmd, "DISARM") == 0) {
+    if (flight_state == FlightState::ARMED) {
+      armed = false;
+      launch_trigger_start_ms = 0;
+      flight_state = FlightState::INIT;
+      state_entry_ms = millis();
+      Serial.println("[STATE] ARMED -> INIT (DISARM)");
+      reply_text(ch, "ACK DISARM");
+    } else if (flight_state == FlightState::INIT) {
+      armed = false;
+      reply_text(ch, "ACK DISARM");
+    } else if (is_two_way_state()) {
+      armed = false;
+      reply_text(ch, "ACK DISARM");
+    } else {
+      reply_text(ch, "NACK DISARM IN FLIGHT");
+    }
+  } else if (strcmp(cmd, "PING") == 0) {
+    reply_text(ch, "PONG");
+  } else if (strcmp(cmd, "CFG?") == 0) {
+    dump_config(ch);
+  } else if (strcmp(cmd, "SAVECFG") == 0) {
+    if (save_config()) reply_text(ch, "ACK SAVECFG");
+    else               reply_text(ch, "NACK SAVECFG FAILED");
+  } else if (strcmp(cmd, "SET") == 0) {
+    char* key = strtok_r(nullptr, " ", &save);
+    char* val = strtok_r(nullptr, " ", &save);
+    if (key == nullptr || val == nullptr || strtok_r(nullptr, " ", &save) != nullptr) {
+      reply_text(ch, "NACK SET USAGE (SET <key> <value>)");
+      return;
+    }
+    const CfgKey* k = find_cfg_key(key);
+    if (k == nullptr) { reply_fmt(ch, "NACK SET %s UNKNOWN", key); return; }
+    if (!is_two_way_state() || flight_state == FlightState::CALIBRATING) {
+      reply_fmt(ch, "NACK SET %s LOCKED", key);
+      return;
+    }
+    float v;
+    if (!parse_cfg_value(*k, val, v)) { reply_fmt(ch, "NACK SET %s BADVAL", key); return; }
+    if (v < k->min_val || v > k->max_val) { reply_fmt(ch, "NACK SET %s RANGE", key); return; }
+    cfg_set_value(*k, v);
+    if (k->type == CfgType::F32)      reply_fmt(ch, "ACK SET %s %.3f", key, v);
+    else if (k->type == CfgType::U32) reply_fmt(ch, "ACK SET %s %lu", key, (unsigned long)v);
+    else                              reply_fmt(ch, "ACK SET %s %d", key, (int)v);
+  } else {
+    reply_fmt(ch, "NACK UNKNOWN %s", cmd);
+  }
+}
+
+// Line-buffered USB serial commands
+void handle_serial_command() {
+  static char cmd_buf[64];
+  static uint8_t cmd_len = 0;
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      cmd_buf[cmd_len] = '\0';
+      if (cmd_len > 0) dispatch_command(cmd_buf, ReplyChannel::USB);
+      cmd_len = 0;
+    } else {
+      if (cmd_len < sizeof(cmd_buf) - 1) { cmd_buf[cmd_len] = c; cmd_len++; }
+    }
+  }
+}
+
+// Process commands received over LoRa (two-way states only: READY/CALIBRATING/INIT)
+void handle_lora_command() {
+  if (!is_two_way_state()) return;
+  if (!rf95.available()) return;
+  uint8_t buf[80];
+  uint8_t len = sizeof(buf);
+  if (!rf95.recv(buf, &len)) return;
+  if (len < sizeof(buf)) buf[len] = '\0'; else buf[sizeof(buf) - 1] = '\0';
+  dispatch_command(reinterpret_cast<char*>(buf), ReplyChannel::LORA);
+}
 // ---------------- SENSOR INIT (called on START from READY; LoRa already inited in setup) ----------------
 bool init_sensors() {
   Wire.setSDA(I2C_SDA);
@@ -287,65 +563,6 @@ bool init_sensors() {
   return true;
 }
 
-// ---------------- COMMANDS (USB Serial + LoRa when pre-boost) ----------------
-void handle_arm_command() {
-  static char cmd_buf[16];
-  static uint8_t cmd_len = 0;
-  while (Serial.available() > 0) {
-    char c = Serial.read();
-    if (c == '\r') continue;
-    if (c == '\n') {
-      cmd_buf[cmd_len] = '\0';
-      if (strcmp(cmd_buf, "START") == 0 || strcmp(cmd_buf, "INIT") == 0) {
-        if (flight_state == FlightState::READY) {
-          Serial.print("[CMD] ");
-          Serial.print(cmd_buf);
-          Serial.println(" received — begin sensor init and calibration.");
-          start_calibration_requested = true;
-        }
-      } else if (strcmp(cmd_buf, "ARM") == 0) {
-        if (flight_state == FlightState::INIT) {
-          armed = true;
-          Serial.println("[CMD] ARM received (USB Serial)");
-        }
-      } else if (strcmp(cmd_buf, "DISARM") == 0) {
-        armed = false;
-        Serial.println("[CMD] DISARM received (USB Serial)");
-      } else if (cmd_len > 0) {
-        Serial.print("[CMD] Unknown: ");
-        Serial.println(cmd_buf);
-      }
-      cmd_len = 0;
-    } else {
-      if (cmd_len < 15) { cmd_buf[cmd_len] = c; cmd_len++; }
-    }
-  }
-}
-
-// Process START / ARM received over LoRa (only in pre-boost states)
-void handle_lora_command() {
-  if (!is_pre_boost_state()) return;
-  if (!rf95.available()) return;
-  uint8_t buf[32];
-  uint8_t len = sizeof(buf);
-  if (!rf95.recv(buf, &len)) return;
-  if (len < sizeof(buf)) buf[len] = '\0'; else buf[sizeof(buf) - 1] = '\0';
-  const char* cmd = (const char*)buf;
-  if (strcmp(cmd, "START") == 0 || strcmp(cmd, "INIT") == 0) {
-    if (flight_state == FlightState::READY) {
-      Serial.print("[CMD] ");
-      Serial.print(cmd);
-      Serial.println(" received over LoRa — begin sensor init and calibration.");
-      start_calibration_requested = true;
-    }
-  } else if (strcmp(cmd, "ARM") == 0) {
-    if (flight_state == FlightState::INIT) {
-      armed = true;
-      Serial.println("[CMD] ARM received over LoRa");
-    }
-  }
-}
-
 // ---------------- GPS (UART0 GP0/GP1; non-blocking — loss of GPS must not stop flight logic) ----------------
 void gps_setup_uart0() {
   Serial1.setTX(GPS_TX_PIN);
@@ -369,38 +586,33 @@ void update_state_machine(uint32_t now_ms, bool baro_ok, float a_net_mag, float 
     case FlightState::CALIBRATING:
       break;
     case FlightState::INIT:
-      // After idle timeout: skip_auto_arm — only ARM (Serial/LoRa) arms; else 1 s auto-arm
-      if (!skip_auto_arm && (now_ms - state_entry_ms) >= INIT_AUTO_ARM_DELAY_MS)
-        armed = true;
+      // Arm only on explicit ARM command (USB or LoRa) — no auto-arm
       if (armed) {
-        const bool from_idle_timeout = skip_auto_arm;
         flight_state = FlightState::ARMED;
         state_entry_ms = now_ms;
-        skip_auto_arm = false;
-        Serial.println(from_idle_timeout ? "[STATE] INIT -> ARMED (re-arm)" : "[STATE] INIT -> ARMED (auto)");
+        Serial.println("[STATE] INIT -> ARMED (ARM command)");
       }
       break;
     case FlightState::ARMED: {
       uint32_t t_in_state = now_ms - state_entry_ms;
-      // Pad idle: no launch for 5 min -> disarm and INIT (re-arm with ARM over LoRa/USB)
-      if (t_in_state >= ARMED_IDLE_TIMEOUT_MS) {
+      // Pad idle: no launch for idle timeout -> disarm and INIT (re-arm with ARM over LoRa/USB)
+      if (t_in_state >= cfg.armed_idle_timeout_ms) {
         armed = false;
         launch_trigger_start_ms = 0;
-        skip_auto_arm = true;
         flight_state = FlightState::INIT;
         state_entry_ms = now_ms;
-        Serial.println("[STATE] ARMED -> INIT (5 min idle — send ARM to re-arm)");
+        Serial.println("[STATE] ARMED -> INIT (idle timeout — send ARM to re-arm)");
         break;
       }
-      if (t_in_state < MIN_TIME_AFTER_ARM_MS) { launch_trigger_start_ms = 0; break; }
+      if (t_in_state < cfg.min_time_after_arm_ms) { launch_trigger_start_ms = 0; break; }
       float alt_gain = alt_f;
-      bool alt_trigger = (baro_ok && (alt_gain >= LAUNCH_ALT_GAIN_M));
-      bool imu_trigger = (a_net_mag >= LAUNCH_ANET_THRESH);
+      bool alt_trigger = (baro_ok && (alt_gain >= cfg.launch_alt_gain_m));
+      bool imu_trigger = (a_net_mag >= cfg.launch_anet_thresh);
       bool launch_cond = (alt_trigger || imu_trigger);
       if (launch_cond) {
         if (launch_trigger_start_ms == 0) launch_trigger_start_ms = now_ms;
       } else launch_trigger_start_ms = 0;
-      if (launch_trigger_start_ms > 0 && (now_ms - launch_trigger_start_ms) >= LAUNCH_CONFIRM_MS) {
+      if (launch_trigger_start_ms > 0 && (now_ms - launch_trigger_start_ms) >= cfg.launch_confirm_ms) {
         launch_detected = true;
         t_launch_ms = now_ms;
         flight_state = FlightState::BOOST;
@@ -413,17 +625,17 @@ void update_state_machine(uint32_t now_ms, bool baro_ok, float a_net_mag, float 
     case FlightState::BOOST: {
       if (!launch_detected) break;
       t_since_launch = now_ms - t_launch_ms;
-      if (AIRSTART_ENABLED && airstart_fire_start_ms == 0 && t_since_launch >= AIRSTART_MS_AFTER_LAUNCH) {
+      if (cfg.airstart_enabled && airstart_fire_start_ms == 0 && t_since_launch >= cfg.airstart_ms_after_launch) {
         airstart_fire_start_ms = now_ms;
         digitalWrite(AIRSTART_PIN, HIGH);
         Serial.print("[EVENT] AIRSTART at t_ms="); Serial.println(t_since_launch);
       }
-      if (t_since_launch >= APOGEE_MIN_MS) {
-        bool vneg = (v_est <= APOGEE_VNEG_THRESH);
+      if (t_since_launch >= cfg.apogee_min_ms) {
+        bool vneg = (v_est <= cfg.apogee_vneg_thresh);
         if (vneg) { if (vneg_start_ms == 0) vneg_start_ms = now_ms; }
         else vneg_start_ms = 0;
-        bool apogee_confirmed = (vneg_start_ms > 0 && (now_ms - vneg_start_ms) >= APOGEE_CONFIRM_MS);
-        bool apogee_failsafe = (t_since_launch >= DROGUE_MAX_MS);
+        bool apogee_confirmed = (vneg_start_ms > 0 && (now_ms - vneg_start_ms) >= cfg.apogee_confirm_ms);
+        bool apogee_failsafe = (t_since_launch >= cfg.drogue_max_ms);
         if (apogee_confirmed || apogee_failsafe) {
           apogee_detected = true;
           flight_state = FlightState::APOGEE;
@@ -441,7 +653,7 @@ void update_state_machine(uint32_t now_ms, bool baro_ok, float a_net_mag, float 
       break;
     case FlightState::DEPLOY_DROGUE: {
       t_since_launch = now_ms - t_launch_ms;
-      if (!drogue_marked && (t_since_launch >= DROGUE_MAX_MS || t_since_launch >= DROGUE_MIN_MS)) {
+      if (!drogue_marked && (t_since_launch >= cfg.drogue_max_ms || t_since_launch >= cfg.drogue_min_ms)) {
         drogue_marked = true;
         drogue_fire_start_ms = now_ms;
         digitalWrite(DROGUE_PIN, HIGH);
@@ -456,10 +668,10 @@ void update_state_machine(uint32_t now_ms, bool baro_ok, float a_net_mag, float 
     }
     case FlightState::DROGUE_DESCENT: {
       t_since_launch = now_ms - t_launch_ms;
-      bool main_time_ok = (t_since_launch >= MAIN_MIN_MS);
-      bool main_low_alt = (alt_f <= MAIN_DEPLOY_ALT_M);
+      bool main_time_ok = (t_since_launch >= cfg.main_min_ms);
+      bool main_low_alt = (alt_f <= cfg.main_deploy_alt_m);
       bool main_cond = (main_time_ok && main_low_alt);
-      bool main_failsafe = (t_since_launch >= MAIN_MAX_MS);
+      bool main_failsafe = (t_since_launch >= cfg.main_max_ms);
       if (!main_marked && (main_cond || main_failsafe)) {
         main_marked = true;
         main_fire_start_ms = now_ms;
@@ -484,22 +696,22 @@ void update_state_machine(uint32_t now_ms, bool baro_ok, float a_net_mag, float 
         P_at_main_descent_start = P_pa;
       if (P_at_main_descent_start > 0.0f && baro_ok && isfinite(P_pa)) {
         float dP = fabsf(P_pa - P_at_main_descent_start);
-        if (dP <= GROUND_BARO_THRESH_PA) {
+        if (dP <= cfg.ground_baro_thresh_pa) {
           if (ground_stable_start_ms == 0) ground_stable_start_ms = now_ms;
-          else if ((now_ms - ground_stable_start_ms) >= GROUND_BARO_STABLE_MS) {
+          else if ((now_ms - ground_stable_start_ms) >= cfg.ground_baro_stable_ms) {
             flight_state = FlightState::FINISHED;
             state_entry_ms = now_ms;
-            Serial.println("[STATE] MAIN_DESCENT -> FINISHED (baro stable 30s)");
+            Serial.println("[STATE] MAIN_DESCENT -> FINISHED (baro stable)");
             break;
           }
         } else ground_stable_start_ms = 0;
       }
-      if (isfinite(alt_f) && alt_f >= -GROUND_ALT_NEAR_M && alt_f <= GROUND_ALT_NEAR_M) {
+      if (isfinite(alt_f) && alt_f >= -cfg.ground_alt_near_m && alt_f <= cfg.ground_alt_near_m) {
         if (alt_near_ground_start_ms == 0) alt_near_ground_start_ms = now_ms;
-        else if ((now_ms - alt_near_ground_start_ms) >= GROUND_ALT_HOLD_MS) {
+        else if ((now_ms - alt_near_ground_start_ms) >= cfg.ground_alt_hold_ms) {
           flight_state = FlightState::FINISHED;
           state_entry_ms = now_ms;
-          Serial.println("[STATE] MAIN_DESCENT -> FINISHED (alt near pad 5s)");
+          Serial.println("[STATE] MAIN_DESCENT -> FINISHED (alt near pad)");
         }
       } else alt_near_ground_start_ms = 0;
       break;
@@ -508,13 +720,13 @@ void update_state_machine(uint32_t now_ms, bool baro_ok, float a_net_mag, float 
     default:
       break;
   }
-  if (drogue_fire_start_ms > 0 && (now_ms - drogue_fire_start_ms) >= PYRO_PULSE_MS) {
+  if (drogue_fire_start_ms > 0 && (now_ms - drogue_fire_start_ms) >= cfg.pyro_pulse_ms) {
     digitalWrite(DROGUE_PIN, LOW); drogue_fire_start_ms = 0; Serial.println("[PYRO] DROGUE done");
   }
-  if (main_fire_start_ms > 0 && (now_ms - main_fire_start_ms) >= PYRO_PULSE_MS) {
+  if (main_fire_start_ms > 0 && (now_ms - main_fire_start_ms) >= cfg.pyro_pulse_ms) {
     digitalWrite(MAIN_PIN, LOW); main_fire_start_ms = 0; Serial.println("[PYRO] MAIN done");
   }
-  if (airstart_fire_start_ms > 0 && (now_ms - airstart_fire_start_ms) >= PYRO_PULSE_MS) {
+  if (airstart_fire_start_ms > 0 && (now_ms - airstart_fire_start_ms) >= cfg.pyro_pulse_ms) {
     digitalWrite(AIRSTART_PIN, LOW); airstart_fire_start_ms = 0; Serial.println("[PYRO] AIRSTART done");
   }
 }
@@ -598,13 +810,9 @@ void send_telemetry(uint32_t now_ms) {
   pkt.checksum = telemetry_checksum(pkt);
   rf95.send(reinterpret_cast<const uint8_t*>(&pkt), sizeof(pkt));
   rf95.waitPacketSent();
-  // From BOOST onward: one-way only (rocket → ground), no RX
-  if (flight_state != FlightState::READY && flight_state != FlightState::CALIBRATING &&
-      flight_state != FlightState::INIT && flight_state != FlightState::ARMED) {
-    rf95.setModeIdle();
-  } else {
-    rf95.setModeRx();
-  }
+  // Two-way (TDD) until ARMED: listen for commands between telemetry bursts.
+  // From ARMED onward: one-way only (rocket → ground), no RX.
+  if (is_two_way_state()) rf95.setModeRx(); else rf95.setModeIdle();
 }
 
 // ---------------- SETUP ----------------
@@ -615,7 +823,8 @@ void setup() {
 
   Serial.println("\n=== Rocket FC: BMP390 + LSM6DSOX + LoRa (915 MHz) + GPS (UART0 GP0/GP1) ===");
   Serial.println("State READY. Send START via USB Serial or LoRa to begin init and calibration.");
-  Serial.println("START = 10 s cal + auto-arm 1 s; ARMED idle 5 min -> INIT (send ARM to re-arm). BOOST: one-way LoRa.");
+  Serial.println("ARM only via explicit ARM command (no auto-arm). ARMED idle timeout -> INIT (send ARM to re-arm). From ARMED: one-way LoRa.");
+  load_config();
 
   flight_state = FlightState::READY;
   calibrated = false;
@@ -651,7 +860,7 @@ void loop() {
     send_telemetry(now);
   }
 
-  handle_arm_command();
+  handle_serial_command();
   handle_lora_command();
 
   // READY: wait for START
@@ -707,14 +916,13 @@ void loop() {
       pitch_deg = atan2f(-ax0, sqrtf(ay0*ay0 + az0*az0)) * 180.0f / (float)M_PI;
       yaw_deg   = 0.0f;
       last_attitude_ms = now;
-      skip_auto_arm = false;
       flight_state = FlightState::INIT;
       state_entry_ms = now;
       Serial.println("\n=== Baseline locked (t=0) ===");
       Serial.print("P0_pa="); Serial.println(P0_pa, 2);
       Serial.println("(LSM6DSOX: no mag — yaw from gyro integration. GPS on UART0.)");
       Serial.println("============================\n");
-      Serial.println("Calibration done. Auto-arming in 1 s.");
+      Serial.println("Calibration done. Send ARM to arm (no auto-arm).");
     }
     delay(10);
     return;

@@ -1,5 +1,6 @@
 """
-Rocket telemetry ground station — dual FC1/FC2 panels.
+Rocket telemetry ground station — FC panel (LoRa bridge: TDD two-way link,
+settings read/apply/save) + legacy FC1 direct-serial panel.
 Uses PySide6 (Qt) for the GUI. Install with:  pip install PySide6 pyserial
 """
 
@@ -27,6 +28,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QMessageBox,
     QFrame,
+    QGroupBox,
 )
 from PySide6.QtCore import QTimer, Qt, QRectF
 from PySide6.QtGui import QFont, QPainter, QPen, QBrush, QColor
@@ -45,6 +47,35 @@ STATE_NAMES = [
     "READY", "CALIBRATING", "INIT", "ARMED", "BOOST", "APOGEE",
     "DEPLOY_DROGUE", "DROGUE_DESCENT", "DEPLOY_MAIN", "MAIN_DESCENT", "FINISHED"
 ]
+
+# FC flight-config keys (must match CFG_KEYS in RocketComputer.ino)
+# (key, type, label) — type: u32 = integer, f32 = decimal, bool = 0/1
+SETTINGS_KEYS = [
+    ("launch_alt_gain_m", "f32", "Launch alt gain (m)"),
+    ("launch_anet_thresh", "f32", "Launch accel thresh (m/s²)"),
+    ("launch_confirm_ms", "u32", "Launch confirm (ms)"),
+    ("min_time_after_arm_ms", "u32", "Min time after arm (ms)"),
+    ("armed_idle_timeout_ms", "u32", "Armed idle timeout (ms)"),
+    ("apogee_min_ms", "u32", "Apogee min (ms)"),
+    ("apogee_confirm_ms", "u32", "Apogee confirm (ms)"),
+    ("apogee_vneg_thresh", "f32", "Apogee vneg thresh (m/s)"),
+    ("drogue_min_ms", "u32", "Drogue min (ms)"),
+    ("drogue_max_ms", "u32", "Drogue max (ms)"),
+    ("main_deploy_alt_m", "f32", "Main deploy alt (m)"),
+    ("main_min_ms", "u32", "Main min (ms)"),
+    ("main_max_ms", "u32", "Main max (ms)"),
+    ("airstart_enabled", "bool", "Airstart enabled"),
+    ("airstart_ms_after_launch", "u32", "Airstart delay (ms)"),
+    ("ground_baro_stable_ms", "u32", "Ground baro stable (ms)"),
+    ("ground_baro_thresh_pa", "f32", "Ground baro thresh (Pa)"),
+    ("ground_alt_near_m", "f32", "Ground alt near (m)"),
+    ("ground_alt_hold_ms", "u32", "Ground alt hold (ms)"),
+    ("pyro_pulse_ms", "u32", "Pyro pulse (ms)"),
+]
+
+# States in which the FC accepts SET (two-way TDD link, settings unlocked)
+SETTINGS_STATES = (0, 2)  # READY, INIT
+
 
 # CSV logging
 DATA_DIR = Path("data")
@@ -135,6 +166,18 @@ class TelemetryPanel(QFrame):
         self._stop = threading.Event()
         self._thread = None
 
+        # ACK/NACK tracking for sent commands (filled by reader thread)
+        self._ack_lock = threading.Lock()
+        self._ack_lines = []
+        self._ack_event = threading.Event()
+        self._cmd_busy = False
+
+        # FC settings (CFG lines from FC)
+        self._cfg_lock = threading.Lock()
+        self._cfg_values = {}      # key -> str(value) as last read from FC
+        self._cfg_dirty = False    # reader thread signals update_ui to refresh fields
+        self._cfg_fields = {}      # key -> QLineEdit
+
         # COM port on its own line
         port_row = QHBoxLayout()
         port_row.addWidget(QLabel("COM Port:"))
@@ -168,16 +211,21 @@ class TelemetryPanel(QFrame):
         self.disconnect_btn.clicked.connect(self.disconnect)
         self.disconnect_btn.setEnabled(False)
         btn_row.addWidget(self.disconnect_btn)
-        self.start_btn = QPushButton("START & ARM")
+        self.start_btn = QPushButton("START")
         self.start_btn.clicked.connect(self.send_start_command)
         self.start_btn.setEnabled(False)
-        self.start_btn.setToolTip("Send START: 10 s calibration, then auto-arm after 1 s (from READY)")
+        self.start_btn.setToolTip("Send START: begin sensor init + 10 s calibration (from READY)")
         btn_row.addWidget(self.start_btn)
-        self.rearm_btn = QPushButton("RE-ARM")
+        self.rearm_btn = QPushButton("ARM")
         self.rearm_btn.clicked.connect(self.send_rearm_command)
         self.rearm_btn.setEnabled(False)
-        self.rearm_btn.setToolTip("Send ARM after FC returned to INIT from 5 min idle on pad (LoRa/USB)")
+        self.rearm_btn.setToolTip("Send ARM: INIT → ARMED (explicit command only, no auto-arm). Also re-arms after idle timeout returns FC to INIT")
         btn_row.addWidget(self.rearm_btn)
+        self.disarm_btn = QPushButton("DISARM")
+        self.disarm_btn.clicked.connect(self.send_disarm_command)
+        self.disarm_btn.setEnabled(False)
+        self.disarm_btn.setToolTip("Send DISARM: ARMED → INIT (safe disarm on pad)")
+        btn_row.addWidget(self.disarm_btn)
         layout.addLayout(btn_row)
 
         # State (big)
@@ -248,6 +296,36 @@ class TelemetryPanel(QFrame):
         debug_layout.addWidget(self.watchdog_label, 2, 1)
         layout.addLayout(debug_layout)
 
+        # ---- FC settings (two-way TDD link: readable/editable in READY/INIT only) ----
+        self.settings_box = QGroupBox("FC Settings (two-way until ARMED — editable in READY/INIT only)")
+        settings_layout = QVBoxLayout()
+        cfg_btns = QHBoxLayout()
+        self.cfg_read_btn = QPushButton("Read from FC")
+        self.cfg_read_btn.clicked.connect(self.read_settings)
+        cfg_btns.addWidget(self.cfg_read_btn)
+        self.cfg_apply_btn = QPushButton("Apply changes")
+        self.cfg_apply_btn.clicked.connect(self.apply_settings)
+        cfg_btns.addWidget(self.cfg_apply_btn)
+        self.cfg_save_btn = QPushButton("Save to flash")
+        self.cfg_save_btn.clicked.connect(self.save_settings)
+        cfg_btns.addWidget(self.cfg_save_btn)
+        cfg_btns.addStretch()
+        settings_layout.addLayout(cfg_btns)
+        cfg_grid = QGridLayout()
+        half = (len(SETTINGS_KEYS) + 1) // 2
+        for i, (key, _typ, label) in enumerate(SETTINGS_KEYS):
+            col = 0 if i < half else 2
+            row = i if i < half else i - half
+            cfg_grid.addWidget(QLabel(label), row, col)
+            edit = QLineEdit()
+            edit.setMaximumWidth(90)
+            self._cfg_fields[key] = edit
+            cfg_grid.addWidget(edit, row, col + 1)
+        settings_layout.addLayout(cfg_grid)
+        self.settings_box.setLayout(settings_layout)
+        self.settings_box.setEnabled(False)
+        layout.addWidget(self.settings_box)
+
         self._refresh_ports()
 
     def _refresh_ports(self):
@@ -286,11 +364,16 @@ class TelemetryPanel(QFrame):
         self.disconnect_btn.setEnabled(True)
         self.start_btn.setEnabled(True)
         self.rearm_btn.setEnabled(True)
+        self.disarm_btn.setEnabled(True)
         self._stop.clear()
         self.last_packet_time = time.time()
         self.connection_lost = False
         self._thread = threading.Thread(target=self._reader_loop, daemon=True)
         self._thread.start()
+        # Auto-read FC settings over the two-way link (LoRa bridge panel only;
+        # legacy direct-serial panels don't answer CFG?)
+        if "LoRa" in self.title:
+            QTimer.singleShot(800, self.read_settings)
 
     def disconnect(self):
         self._stop.set()
@@ -305,6 +388,7 @@ class TelemetryPanel(QFrame):
         self.disconnect_btn.setEnabled(False)
         self.start_btn.setEnabled(False)
         self.rearm_btn.setEnabled(False)
+        self.disarm_btn.setEnabled(False)
         self.last_packet_time = None
         self.connection_lost = True
 
@@ -343,119 +427,281 @@ class TelemetryPanel(QFrame):
             if not chunk:
                 continue
             buf += chunk
-            while len(buf) >= PACKET_SIZE_OLD:
-                if len(buf) >= 2 and buf[0:2] != b"RC":
-                    pos = buf.find(b"RC", 1)
-                    if pos == -1:
-                        buf = buf[-1:] if len(buf) > PACKET_SIZE else buf
+            # Stream is a sequence of records: 28-byte "RC" binary telemetry packets
+            # (or legacy 22-byte) and newline-terminated text lines (ACK/NACK/CFG/PONG
+            # from the FC via the bridge, bridge banners on connect).
+            while True:
+                if buf[:2] == b"RC":
+                    use_extended = len(buf) >= PACKET_SIZE
+                    pkt_size = PACKET_SIZE if use_extended else PACKET_SIZE_OLD
+                    if len(buf) < pkt_size:
                         break
-                    buf = buf[pos:]
-                    if len(buf) < PACKET_SIZE_OLD:
-                        break
-                use_extended = len(buf) >= PACKET_SIZE
-                pkt_size = PACKET_SIZE if use_extended else PACKET_SIZE_OLD
-                if len(buf) < pkt_size:
-                    break
-                packet = buf[:pkt_size]
-                buf = buf[pkt_size:]
-                self.last_raw_hex = packet.hex(" ")
-                if packet[0:2] != b"RC":
-                    self._set_error("Bad header")
-                    continue
-                try:
-                    if use_extended:
-                        unpacked = struct.unpack(PACKET_FMT, packet)
-                        magic, time_ms, alt_cm, vel_cmps, lat_1e7, lon_1e7, state, roll_centi, pitch_centi, yaw_centi, checksum = unpacked
-                    else:
-                        unpacked = struct.unpack(PACKET_FMT_OLD, packet)
-                        magic, time_ms, alt_cm, vel_cmps, lat_1e7, lon_1e7, state, checksum = unpacked
-                        roll_centi = pitch_centi = yaw_centi = None
-                except struct.error as e:
-                    self._set_error(str(e))
-                    continue
-                if magic != b"RC":
-                    continue
-                calc_cs = 0
-                for i in range(len(packet) - 1):
-                    calc_cs ^= packet[i]
-                if calc_cs != checksum:
-                    self._set_error("Checksum mismatch")
-                    continue
-                self.last_packet_time = time.time()
-                self.connection_lost = False
-                self.last_error_msg = ""
-                self._status_text = "Receiving OK"
-                self.time_ms = time_ms
-                self.alt = alt_cm / 100.0
-                self.vel = vel_cmps / 100.0
-                self.lat = lat_1e7 / 1e7 if lat_1e7 != -2147483648 else None
-                self.lon = lon_1e7 / 1e7 if lon_1e7 != -2147483648 else None
-                self.state = state
-                if roll_centi is not None:
-                    self.roll = roll_centi / 100.0
-                    self.pitch = pitch_centi / 100.0
-                    self.yaw = yaw_centi / 100.0
-                else:
-                    self.roll = self.pitch = self.yaw = None
-                if self.log_file is not None:
+                    packet = buf[:pkt_size]
+                    buf = buf[pkt_size:]
+                    self.last_raw_hex = packet.hex(" ")
+                    if packet[0:2] != b"RC":
+                        self._set_error("Bad header")
+                        continue
                     try:
-                        ts_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-                        state_name = STATE_NAMES[state] if 0 <= state < len(STATE_NAMES) else ""
-                        row = [
-                            ts_utc, time_ms,
-                            self.alt if self.alt is not None else "",
-                            self.vel if self.vel is not None else "",
-                            self.lat if self.lat is not None else "",
-                            self.lon if self.lon is not None else "",
-                            state, state_name,
-                            self.roll if self.roll is not None else "",
-                            self.pitch if self.pitch is not None else "",
-                            self.yaw if self.yaw is not None else "",
-                        ]
-                        w = csv.writer(self.log_file, lineterminator="\n")
-                        w.writerow(row)
-                        self.log_file.flush()
-                    except Exception:
-                        pass
+                        if use_extended:
+                            unpacked = struct.unpack(PACKET_FMT, packet)
+                            magic, time_ms, alt_cm, vel_cmps, lat_1e7, lon_1e7, state, roll_centi, pitch_centi, yaw_centi, checksum = unpacked
+                        else:
+                            unpacked = struct.unpack(PACKET_FMT_OLD, packet)
+                            magic, time_ms, alt_cm, vel_cmps, lat_1e7, lon_1e7, state, checksum = unpacked
+                            roll_centi = pitch_centi = yaw_centi = None
+                    except struct.error as e:
+                        self._set_error(str(e))
+                        continue
+                    if magic != b"RC":
+                        continue
+                    calc_cs = 0
+                    for i in range(len(packet) - 1):
+                        calc_cs ^= packet[i]
+                    if calc_cs != checksum:
+                        self._set_error("Checksum mismatch")
+                        continue
+                    self.last_packet_time = time.time()
+                    self.connection_lost = False
+                    self.last_error_msg = ""
+                    self._status_text = "Receiving OK"
+                    self.time_ms = time_ms
+                    self.alt = alt_cm / 100.0
+                    self.vel = vel_cmps / 100.0
+                    self.lat = lat_1e7 / 1e7 if lat_1e7 != -2147483648 else None
+                    self.lon = lon_1e7 / 1e7 if lon_1e7 != -2147483648 else None
+                    self.state = state
+                    if roll_centi is not None:
+                        self.roll = roll_centi / 100.0
+                        self.pitch = pitch_centi / 100.0
+                        self.yaw = yaw_centi / 100.0
+                    else:
+                        self.roll = self.pitch = self.yaw = None
+                    if self.log_file is not None:
+                        try:
+                            ts_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+                            state_name = STATE_NAMES[state] if 0 <= state < len(STATE_NAMES) else ""
+                            row = [
+                                ts_utc, time_ms,
+                                self.alt if self.alt is not None else "",
+                                self.vel if self.vel is not None else "",
+                                self.lat if self.lat is not None else "",
+                                self.lon if self.lon is not None else "",
+                                state, state_name,
+                                self.roll if self.roll is not None else "",
+                                self.pitch if self.pitch is not None else "",
+                                self.yaw if self.yaw is not None else "",
+                            ]
+                            w = csv.writer(self.log_file, lineterminator="\n")
+                            w.writerow(row)
+                            self.log_file.flush()
+                        except Exception:
+                            pass
+                else:
+                    nl = buf.find(b"\n")
+                    if nl == -1:
+                        # No complete line yet; keep only a trailing window for resync
+                        if len(buf) > PACKET_SIZE:
+                            buf = buf[-PACKET_SIZE:]
+                        break
+                    line = buf[:nl]
+                    buf = buf[nl + 1:]
+                    if line:
+                        self._handle_line(line)
         self._status_text = "Disconnected (reader stopped)"
 
-    def send_start_command(self):
-        if self.ser is None or not self.ser.is_open:
-            QMessageBox.critical(self, "Not Connected", f"Cannot send START: {self.title} not connected.")
-            return
+    def _handle_line(self, raw: bytes):
+        """Handle a text line from the FC/bridge: ACK/NACK, PONG, CFG responses."""
         try:
-            self.ser.write(b"START\n")
-            if DEBUG_PRINT:
-                print(f"[{self.title}] START & ARM sent")
-            self._status_text = "START & ARM sent"
-        except Exception as e:
-            QMessageBox.critical(self, "Send Error", str(e))
+            line = raw.decode("ascii", errors="replace").strip()
+        except Exception:
+            return
+        if not line:
+            return
+        if line.startswith("ACK") or line.startswith("NACK") or line == "PONG":
+            with self._ack_lock:
+                self._ack_lines.append(line)
+                self._ack_event.set()
+        elif line.startswith("CFG "):
+            parts = line.split(" ", 2)
+            if len(parts) == 3:
+                with self._cfg_lock:
+                    self._cfg_values[parts[1]] = parts[2]
+                    self._cfg_dirty = True
+        elif line == "CFG END":
+            with self._cfg_lock:
+                self._cfg_dirty = True
+        # anything else (bridge banner, etc.) is ignored
+
+    # ---------------- Commands (ACK-aware, two-way until FC is ARMED) ----------------
+    def _write_line(self, text: str):
+        self.ser.write(text.encode("ascii") + b"\n")
+
+    def _wait_for_ack(self, expect_prefix="ACK", timeout=2.0):
+        """Collect reply lines until one matches expect_prefix (or a NACK) arrives."""
+        deadline = time.time() + timeout
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return None
+            self._ack_event.wait(min(remaining, 0.2))
+            with self._ack_lock:
+                lines = list(self._ack_lines)
+                self._ack_lines.clear()
+            self._ack_event.clear()
+            for ln in lines:
+                if ln.startswith(expect_prefix) or ln.startswith("NACK"):
+                    return ln
+        return None
+
+    def send_command_blocking(self, cmd, expect_prefix="ACK", timeout=2.0, retries=3):
+        """Send a command line, wait for its reply. Returns (ok, response_line|error)."""
+        if self.ser is None or not self.ser.is_open:
+            return False, "not connected"
+        with self._ack_lock:
+            self._ack_lines.clear()
+        self._ack_event.clear()
+        for _ in range(retries):
+            try:
+                self._write_line(cmd)
+            except Exception as e:
+                return False, str(e)
+            resp = self._wait_for_ack(expect_prefix=expect_prefix, timeout=timeout)
+            if resp is not None:
+                return (resp.startswith("ACK") or resp == "PONG"), resp
+        return False, "no reply (timeout)"
+
+    def _run_cmd(self, cmd, label):
+        if self.ser is None or not self.ser.is_open:
+            QMessageBox.critical(self, "Not Connected", f"Cannot send {label}: {self.title} not connected.")
+            return
+        if self._cmd_busy:
+            self._status_text = "Busy — previous command still running"
+            return
+        self._cmd_busy = True
+        self._status_text = f"{label} sent — waiting for ACK..."
+
+        def worker():
+            ok, resp = self.send_command_blocking(cmd)
+            self._status_text = f"{label} acknowledged" if ok else f"{label} failed: {resp}"
+            self._cmd_busy = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def send_start_command(self):
+        self._run_cmd("START", "START")
 
     def send_rearm_command(self):
-        if self.ser is None or not self.ser.is_open:
-            QMessageBox.critical(self, "Not Connected", f"Cannot send RE-ARM: {self.title} not connected.")
+        self._run_cmd("ARM", "ARM")
+
+    def send_disarm_command(self):
+        self._run_cmd("DISARM", "DISARM")
+
+    # ---------------- FC settings ----------------
+    def read_settings(self):
+        if self.ser is None or not self.ser.is_open or self._cmd_busy:
             return
-        try:
-            self.ser.write(b"ARM\n")
-            if DEBUG_PRINT:
-                print(f"[{self.title}] RE-ARM (ARM) sent")
-            self._status_text = "RE-ARM (ARM) sent"
-        except Exception as e:
-            QMessageBox.critical(self, "Send Error", str(e))
+        self._cmd_busy = True
+        self._status_text = "Reading settings from FC..."
+
+        def worker():
+            with self._cfg_lock:
+                self._cfg_values.clear()
+            ok, resp = self.send_command_blocking("CFG?", expect_prefix="CFG END", timeout=2.0, retries=2)
+            with self._cfg_lock:
+                n = len(self._cfg_values)
+                self._cfg_dirty = True
+            self._status_text = f"Settings read ({n} keys)" if ok else f"Settings read failed: {resp}"
+            self._cmd_busy = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def apply_settings(self):
+        if self.ser is None or not self.ser.is_open or self._cmd_busy:
+            return
+        changes = []
+        for key, typ, _label in SETTINGS_KEYS:
+            edit = self._cfg_fields.get(key)
+            if edit is None:
+                continue
+            val = edit.text().strip()
+            with self._cfg_lock:
+                old = self._cfg_values.get(key)
+            if old is None or val != old:
+                changes.append((key, typ, val))
+        if not changes:
+            self._status_text = "No setting changes to apply"
+            return
+        # local sanity check before hitting the FC
+        for key, typ, val in changes:
+            try:
+                if typ == "u32":
+                    int(val)
+                elif typ == "f32":
+                    float(val)
+                elif typ == "bool":
+                    if val.lower() not in ("0", "1", "true", "false", "on", "off"):
+                        raise ValueError
+            except ValueError:
+                QMessageBox.critical(self, "Invalid value", f"{key}: '{val}' is not a valid {typ} value.")
+                return
+        self._cmd_busy = True
+        self._status_text = f"Applying {len(changes)} setting(s)..."
+
+        def worker():
+            fails = []
+            for key, typ, val in changes:
+                if typ == "bool":
+                    val = "1" if val.lower() in ("1", "true", "on") else "0"
+                ok, resp = self.send_command_blocking(f"SET {key} {val}")
+                if not ok:
+                    fails.append(f"{key}: {resp}")
+            self._status_text = ("Apply failed — " + "; ".join(fails[:3])) if fails else f"Applied {len(changes)} setting(s)"
+            self._cmd_busy = False
+            self.read_settings()  # refresh fields from FC ground truth
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def save_settings(self):
+        if self.ser is None or not self.ser.is_open or self._cmd_busy:
+            return
+        self._cmd_busy = True
+        self._status_text = "Saving settings to FC flash..."
+
+        def worker():
+            ok, resp = self.send_command_blocking("SAVECFG")
+            self._status_text = "Settings saved to flash" if ok else f"Save failed: {resp}"
+            self._cmd_busy = False
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def update_ui(self):
         status_display = self._status_text
-        # FC2 gets telemetry only after START is sent to FC2 over USB; hint when connected but no data
-        if "FC2" in self.title and self.ser is not None and self.ser.is_open and self.last_packet_time is None:
+        # FC (LoRa bridge) sends telemetry only after START; hint when connected but no data
+        if "LoRa" in self.title and self.ser is not None and self.ser.is_open and self.last_packet_time is None:
             if "Connected" in self._status_text and "Error" not in self._status_text:
-                status_display = "Connected — no data. Send START to FC2 over USB (115200), then wait for calibration."
+                status_display = "Connected — no data. Send START, then wait for calibration."
         self.status_label.setText(status_display)
-        if "Error" in self._status_text:
+        if "Error" in self._status_text or "failed" in self._status_text:
             self.status_label.setStyleSheet("color: #a00;")
-        elif "Connected" in status_display or "Receiving" in self._status_text or "START" in self._status_text:
+        elif "Connected" in status_display or "Receiving" in self._status_text or "acknowledged" in self._status_text:
             self.status_label.setStyleSheet("color: #060;")
         else:
             self.status_label.setStyleSheet("color: #666;")
+
+        # Settings: refresh fields when the reader thread reports new CFG data;
+        # editable only in READY/INIT (FC rejects SET anywhere else anyway)
+        with self._cfg_lock:
+            dirty = self._cfg_dirty
+            self._cfg_dirty = False
+            values = dict(self._cfg_values)
+        if dirty:
+            for key, edit in self._cfg_fields.items():
+                if key in values:
+                    edit.setText(values[key])
+        settings_ok = (self.ser is not None and self.ser.is_open
+                       and self.state is not None and self.state in SETTINGS_STATES)
+        self.settings_box.setEnabled(settings_ok)
         self.alt_value.setText(self._fmt_num(self.alt, "m"))
         self.vel_value.setText(self._fmt_num(self.vel, "m/s"))
         self.lat_value.setText(self._fmt_float(self.lat))
