@@ -58,9 +58,15 @@ pip install -r requirements.txt   # or: pip install PySide6 pyserial
 python groundStation.py
 ```
 
-Connect the LoRa bridge's COM port (57600) to the **FC (LoRa → Serial)** panel. The panel
-shows telemetry, START/ARM/DISARM buttons (ACK-confirmed), and the settings editor.
-The second panel is for a legacy FC1 on direct serial.
+Connect the LoRa bridge's COM port (57600) to the **FC (LoRa → Serial)** panel. The window shows:
+
+- **FC panel** — telemetry, START/ARM/DISARM buttons (ACK-confirmed), and the settings editor
+- **Live plots** — altitude and velocity vs time (rolling 120 s window)
+- **Live map** — OpenStreetMap tiles around the launch pad (±~1 km, zoom 16) with the
+  rocket's track and current position. The PC's rough location is looked up via geo-IP at
+  startup (with the first GPS fix as fallback) and the 3×3 tile square is downloaded on a
+  background thread into a RAM cache, so the map never blocks telemetry. Map data
+  © OpenStreetMap contributors.
 
 ## How to use
 1. Simulate your rocket and get expected apogee/deploy times.

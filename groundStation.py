@@ -1,20 +1,25 @@
 """
 Rocket telemetry ground station — FC panel (LoRa bridge: TDD two-way link,
-settings read/apply/save) + legacy FC1 direct-serial panel.
+settings read/apply/save), live altitude/velocity plots, and a live OSM map
+of the rocket position (tiles fetched on a background thread, cached in RAM).
 Uses PySide6 (Qt) for the GUI. Install with:  pip install PySide6 pyserial
 """
 
 import sys
 import os
 import csv
-import threading
-import serial
-import serial.tools.list_ports
+import json
+import math
+import queue
 import struct
+import threading
 import time
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+import serial
+import serial.tools.list_ports
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -30,9 +35,8 @@ from PySide6.QtWidgets import (
     QFrame,
     QGroupBox,
 )
-from PySide6.QtCore import QTimer, Qt, QRectF
-from PySide6.QtGui import QFont, QPainter, QPen, QBrush, QColor
-import math
+from PySide6.QtCore import QTimer, Qt, QRectF, QPointF
+from PySide6.QtGui import QFont, QPainter, QPen, QBrush, QColor, QPixmap, QPolygonF
 
 # ---------- CONFIG ----------
 DEFAULT_BAUD = 57600
@@ -121,6 +125,304 @@ class AttitudeWidget(QWidget):
         p.setPen(QPen(QColor(50, 50, 50), 2))
         p.setBrush(QBrush(Qt.BrushStyle.NoBrush))
         p.drawEllipse(5, 5, self.size - 10, self.size - 10)
+
+
+# ---------------- Live plots ----------------
+class LivePlotWidget(QWidget):
+    """Rolling time-series: altitude (blue, left axis) and velocity (red, right axis)."""
+
+    def __init__(self, window_s=120.0, max_points=7200, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(230)
+        self._window_s = window_s
+        self._samples = []       # (t_s, alt_m|None, vel_m/s|None)
+        self._max_points = max_points
+
+    def add_sample(self, t_s, alt, vel):
+        self._samples.append((t_s, alt, vel))
+        # trim: by count and by age (keep a bit beyond the display window)
+        if len(self._samples) > self._max_points:
+            self._samples = self._samples[-self._max_points // 2:]
+        cutoff = t_s - self._window_s * 3
+        while len(self._samples) > 2 and self._samples[0][0] < cutoff:
+            self._samples.pop(0)
+        self.update()
+
+    def clear(self):
+        self._samples = []
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.fillRect(self.rect(), QColor(255, 255, 255))
+        if len(self._samples) < 2:
+            p.setPen(QColor(130, 130, 130))
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Waiting for telemetry…")
+            return
+        w, h = self.width(), self.height()
+        ml, mr, mt, mb = 46, 46, 26, 24
+        cw, ch = w - ml - mr, h - mt - mb
+        t_end = self._samples[-1][0]
+        t0 = t_end - self._window_s
+        win = [s for s in self._samples if s[0] >= t0]
+        if len(win) < 2:
+            win = self._samples[-2:]
+        t0, t_end = win[0][0], win[-1][0]
+        span = max(1e-6, t_end - t0)
+        alts = [s[1] for s in win if s[1] is not None]
+        vels = [s[2] for s in win if s[2] is not None]
+        if not alts:
+            p.setPen(QColor(130, 130, 130))
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Waiting for telemetry…")
+            return
+        a_lo, a_hi = min(alts), max(alts)
+        if a_hi - a_lo < 1.0:
+            a_hi = a_lo + 1.0
+        if vels:
+            v_lo, v_hi = min(vels), max(vels)
+            if v_hi - v_lo < 1.0:
+                v_hi = v_lo + 1.0
+        else:
+            v_lo, v_hi = 0.0, 1.0
+
+        def xa(t):
+            return ml + (t - t0) / span * cw
+
+        def ya(a):
+            return mt + ch - (a - a_lo) / (a_hi - a_lo) * ch
+
+        def yv(v):
+            return mt + ch - (v - v_lo) / (v_hi - v_lo) * ch
+
+        # grid + axis labels
+        p.setFont(QFont("Segoe UI", 8))
+        p.setPen(QColor(228, 228, 228))
+        for i in range(5):
+            y = mt + ch * i / 4
+            p.drawLine(int(ml), int(y), int(w - mr), int(y))
+        p.setPen(QColor(100, 100, 100))
+        for i in range(5):
+            y = mt + ch * i / 4
+            av = a_hi - (a_hi - a_lo) * i / 4
+            p.drawText(2, int(y) + 3, f"{av:.0f} m")
+            vv = v_hi - (v_hi - v_lo) * i / 4
+            p.drawText(int(w - mr + 4), int(y) + 3, f"{vv:.0f}")
+        for i in range(6):
+            tv = t0 + span * i / 5
+            p.setPen(QColor(228, 228, 228))
+            p.drawLine(int(xa(tv)), int(mt), int(xa(tv)), int(mt + ch))
+            p.setPen(QColor(100, 100, 100))
+            p.drawText(int(xa(tv)) - 12, h - 8, f"{tv:.0f}s")
+        # series
+        alt_pts = []
+        vel_pts = []
+        for (t, a, v) in win:
+            if a is not None:
+                alt_pts.append(QPointF(xa(t), ya(a)))
+            if v is not None:
+                vel_pts.append(QPointF(xa(t), yv(v)))
+        if len(alt_pts) >= 2:
+            p.setPen(QPen(QColor(0, 102, 204), 2))
+            p.drawPolyline(QPolygonF(alt_pts))
+        if len(vel_pts) >= 2:
+            p.setPen(QPen(QColor(204, 51, 0), 2))
+            p.drawPolyline(QPolygonF(vel_pts))
+        # legend
+        p.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        p.setPen(QColor(0, 102, 204))
+        p.drawText(int(ml) + 8, int(mt) + 14, "ALTITUDE (m)")
+        p.setPen(QColor(204, 51, 0))
+        p.drawText(int(ml) + 110, int(mt) + 14, "VELOCITY (m/s, right axis)")
+
+
+# ---------------- Map (OpenStreetMap tiles, RAM cache, background fetch) ----------------
+TILE_SIZE = 256
+MAP_ZOOM = 16
+MAP_GRID = 3           # 3x3 tiles at z16 ≈ ±0.7–1 km square
+OSM_USER_AGENT = "RocketGroundStation/1.0 (amateur rocketry ground station, personal use)"
+
+
+def lonlat_to_global_px(lat, lon, zoom):
+    """Slippy-map projection: lat/lon -> global pixel coords at zoom."""
+    n = 2.0 ** zoom * TILE_SIZE
+    x = (lon + 180.0) / 360.0 * n
+    lat_rad = math.radians(lat)
+    y = (1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n
+    return x, y
+
+
+def fetch_pc_location(timeout=6.0):
+    """Best-effort geo-IP lookup of the ground station's rough location. None on failure."""
+    for url in ("https://ipapi.co/json/", "http://ip-api.com/json/"):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": OSM_USER_AGENT})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                d = json.loads(r.read().decode("utf-8", "replace"))
+            lat = d.get("lat", d.get("latitude"))
+            lon = d.get("lon", d.get("longitude"))
+            if lat is not None and lon is not None:
+                return float(lat), float(lon)
+        except Exception:
+            continue
+    return None
+
+
+class TileFetcher:
+    """Downloads OSM tiles on a worker thread into a RAM cache; GUI drains results."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cache = {}               # (z, x, y) -> png bytes
+        self._pending = set()
+        self._queue = queue.Queue()
+        self._results = queue.Queue()  # GUI drains: (z, x, y, png bytes)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def request(self, z, x, y):
+        key = (z, x, y)
+        with self._lock:
+            if key in self._cache or key in self._pending:
+                return
+            self._pending.add(key)
+        self._queue.put(key)
+
+    def drain(self):
+        out = []
+        while True:
+            try:
+                out.append(self._results.get_nowait())
+            except queue.Empty:
+                break
+        return out
+
+    def stop(self):
+        self._stop.set()
+
+    def _worker(self):
+        while not self._stop.is_set():
+            try:
+                z, x, y = self._queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            data = None
+            try:
+                url = f"https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+                req = urllib.request.Request(url, headers={"User-Agent": OSM_USER_AGENT})
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    data = r.read()
+            except Exception:
+                pass
+            with self._lock:
+                self._pending.discard((z, x, y))
+                if data:
+                    self._cache[(z, x, y)] = data
+            if data:
+                self._results.put((z, x, y, data))
+
+
+class MapWidget(QWidget):
+    """Live map around the launch pad: cached OSM tiles + rocket track + position."""
+
+    def __init__(self, fetcher: TileFetcher, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(320)
+        self._fetcher = fetcher
+        self._pixmaps = {}     # (z, x, y) -> QPixmap
+        self._origin = None    # (tile_x, tile_y) of grid NW corner
+        self._zoom = MAP_ZOOM
+        self._center = None
+        self._track = []       # (lat, lon), capped
+        self._status = "Waiting for location (PC geo-IP or first GPS fix)…"
+
+    def set_center(self, lat, lon):
+        gx, gy = lonlat_to_global_px(lat, lon, self._zoom)
+        cx, cy = int(gx // TILE_SIZE), int(gy // TILE_SIZE)
+        self._origin = (cx - MAP_GRID // 2, cy - MAP_GRID // 2)
+        self._center = (lat, lon)
+        self._status = "Loading map tiles…"
+        ox, oy = self._origin
+        for dy in range(MAP_GRID):
+            for dx in range(MAP_GRID):
+                self._fetcher.request(self._zoom, ox + dx, oy + dy)
+        self.update()
+
+    def add_position(self, lat, lon):
+        self._track.append((lat, lon))
+        if len(self._track) > 3000:
+            self._track = self._track[-1500:]
+        self.update()
+
+    def last_position(self):
+        return self._track[-1] if self._track else None
+
+    def clear_track(self):
+        self._track = []
+        self.update()
+
+    def ingest_tiles(self, tiles):
+        changed = False
+        for (z, x, y, data) in tiles:
+            pm = QPixmap()
+            if pm.loadFromData(data):
+                self._pixmaps[(z, x, y)] = pm
+                changed = True
+        if changed:
+            self._status = ""
+            self.update()
+
+    def has_tiles(self):
+        return any(k[0] == self._zoom for k in self._pixmaps)
+
+    def _geo_to_screen(self, lat, lon, scale, ox, oy):
+        gx, gy = lonlat_to_global_px(lat, lon, self._zoom)
+        sx = ox + (gx - self._origin[0] * TILE_SIZE) * scale
+        sy = oy + (gy - self._origin[1] * TILE_SIZE) * scale
+        return sx, sy
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(233, 236, 233))
+        if self._origin is None:
+            p.setPen(QColor(110, 110, 110))
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._status)
+            return
+        grid_px = MAP_GRID * TILE_SIZE
+        scale = min(self.width(), self.height()) / grid_px
+        ox = (self.width() - grid_px * scale) / 2
+        oy = (self.height() - grid_px * scale) / 2
+        tx0, ty0 = self._origin
+        for dy in range(MAP_GRID):
+            for dx in range(MAP_GRID):
+                key = (self._zoom, tx0 + dx, ty0 + dy)
+                pm = self._pixmaps.get(key)
+                rect = QRectF(ox + dx * TILE_SIZE * scale, oy + dy * TILE_SIZE * scale,
+                              TILE_SIZE * scale, TILE_SIZE * scale)
+                if pm is not None:
+                    p.drawPixmap(rect, pm, QRectF(0, 0, TILE_SIZE, TILE_SIZE))
+                else:
+                    p.fillRect(rect, QColor(222, 226, 222))
+        if not self.has_tiles():
+            p.setPen(QColor(110, 110, 110))
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
+                       self._status or "Map unavailable (offline?) — tiles failed to load")
+        if len(self._track) >= 2:
+            p.setPen(QPen(QColor(255, 210, 0), 2))
+            pts = [QPointF(*self._geo_to_screen(la, lo, scale, ox, oy)) for (la, lo) in self._track]
+            p.drawPolyline(QPolygonF(pts))
+        if self._track:
+            sx, sy = self._geo_to_screen(*self._track[-1], scale, ox, oy)
+            p.setPen(QPen(QColor(200, 30, 30), 2))
+            p.setBrush(QBrush(QColor(220, 40, 40)))
+            p.drawEllipse(QPointF(sx, sy), 5, 5)
+        # OSM attribution (required by the tile license)
+        p.setPen(QColor(90, 90, 90))
+        p.setFont(QFont("Segoe UI", 8))
+        p.drawText(6, self.height() - 6, "© OpenStreetMap contributors")
 
 
 def get_serial_ports():
@@ -775,12 +1077,12 @@ def cleanup_empty_data_dirs():
                 pass
 
 
-class DualTelemetryHUD(QMainWindow):
+class GroundStationWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Telemetry HUD — FC1 | FC2")
-        self.setMinimumSize(1200, 640)
-        self.resize(1400, 720)
+        self.setWindowTitle("Telemetry HUD — FC")
+        self.setMinimumSize(1200, 720)
+        self.resize(1500, 860)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -791,7 +1093,7 @@ class DualTelemetryHUD(QMainWindow):
 
         top_bar = QHBoxLayout()
         refresh_btn = QPushButton("Refresh COM ports")
-        refresh_btn.clicked.connect(self._refresh_all_ports)
+        refresh_btn.clicked.connect(self._refresh_ports)
         top_bar.addWidget(refresh_btn)
         self._log_btn = QPushButton("Start logging")
         self._log_btn.clicked.connect(self._toggle_logging)
@@ -801,68 +1103,107 @@ class DualTelemetryHUD(QMainWindow):
         main_layout.addLayout(top_bar)
 
         content = QHBoxLayout()
-        self.panel_fc1 = TelemetryPanel("FC1 (Serial)", DEFAULT_BAUD)
-        self.panel_fc2 = TelemetryPanel("FC (LoRa → Serial)", DEFAULT_BAUD)
-        content.addWidget(self.panel_fc1)
-        content.addWidget(self.panel_fc2)
+        self.panel = TelemetryPanel("FC (LoRa → Serial)", DEFAULT_BAUD)
+        content.addWidget(self.panel, 1)
+
+        right_col = QVBoxLayout()
+        right_col.addWidget(QLabel("ALTITUDE / VELOCITY — LIVE"))
+        self.plot = LivePlotWidget(window_s=120.0)
+        right_col.addWidget(self.plot)
+        map_row = QHBoxLayout()
+        map_row.addWidget(QLabel("MAP — LIVE (±~1 km)"))
+        map_row.addStretch()
+        self._center_btn = QPushButton("Center on rocket")
+        self._center_btn.clicked.connect(self._center_on_rocket)
+        map_row.addWidget(self._center_btn)
+        right_col.addLayout(map_row)
+        self.fetcher = TileFetcher()
+        self.map = MapWidget(self.fetcher)
+        right_col.addWidget(self.map, 1)
+        content.addLayout(right_col, 1)
         main_layout.addLayout(content)
+
+        # Map centering state: geo-IP result (or first GPS fix) claims the center once
+        self._geo_queue = queue.Queue()
+        self._map_centered = False
+        self._last_sample_t = None
+        threading.Thread(target=self._locate_pc, daemon=True).start()
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._schedule_ui_update)
         self._timer.start(100)
 
-    def _refresh_all_ports(self):
-        self.panel_fc1._refresh_ports()
-        self.panel_fc2._refresh_ports()
+    def _locate_pc(self):
+        """Background: find rough PC location at startup so the map is ready before GPS lock."""
+        loc = fetch_pc_location()
+        if loc is not None:
+            self._geo_queue.put(loc)
+
+    def _center_on_rocket(self):
+        pos = self.map.last_position()
+        if pos is not None:
+            self.map.set_center(*pos)
+            self._map_centered = True
+
+    def _refresh_ports(self):
+        self.panel._refresh_ports()
 
     def _toggle_logging(self):
         if self._logging_active:
-            self.panel_fc1.stop_logging()
-            self.panel_fc2.stop_logging()
+            self.panel.stop_logging()
             self._logging_active = False
             self._log_btn.setText("Start logging")
             return
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         start_utc = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        dirs = [DATA_DIR / f"{start_utc}--FC_1", DATA_DIR / f"{start_utc}--FC_2"]
-        for d in dirs:
-            d.mkdir(parents=True, exist_ok=True)
-        files = [dirs[0] / "data.csv", dirs[1] / "data.csv"]
-        f1 = f2 = None
+        d = DATA_DIR / start_utc
+        d.mkdir(parents=True, exist_ok=True)
+        f = None
         try:
-            f1 = open(files[0], "w", newline="")
-            f2 = open(files[1], "w", newline="")
-            csv.writer(f1, lineterminator="\n").writerow(CSV_HEADER)
-            csv.writer(f2, lineterminator="\n").writerow(CSV_HEADER)
-            f1.flush()
-            f2.flush()
-            self.panel_fc1.set_log_file(f1)
-            self.panel_fc2.set_log_file(f2)
+            f = open(d / "data.csv", "w", newline="")
+            csv.writer(f, lineterminator="\n").writerow(CSV_HEADER)
+            f.flush()
+            self.panel.set_log_file(f)
             self._logging_active = True
             self._log_btn.setText("Stop logging")
         except Exception as e:
             QMessageBox.critical(self, "Logging Error", f"Could not start logging: {e}")
-            for f in (f1, f2):
-                if f and not f.closed:
-                    try:
-                        f.close()
-                    except Exception:
-                        pass
+            if f and not f.closed:
+                try:
+                    f.close()
+                except Exception:
+                    pass
 
     def _schedule_ui_update(self):
-        self.panel_fc1.update_ui()
-        self.panel_fc2.update_ui()
+        self.panel.update_ui()
+        # Feed plot + map with fresh telemetry samples
+        if self.panel.time_ms is not None and self.panel.time_ms != self._last_sample_t:
+            self._last_sample_t = self.panel.time_ms
+            self.plot.add_sample(self.panel.time_ms / 1000.0, self.panel.alt, self.panel.vel)
+            if self.panel.lat is not None and self.panel.lon is not None:
+                if not self._map_centered:
+                    self._map_centered = True
+                    self.map.set_center(self.panel.lat, self.panel.lon)
+                self.map.add_position(self.panel.lat, self.panel.lon)
+        # Drain background results (map tiles, PC location) — never blocks the GUI
+        self.map.ingest_tiles(self.fetcher.drain())
+        try:
+            loc = self._geo_queue.get_nowait()
+        except queue.Empty:
+            loc = None
+        if loc is not None and not self._map_centered:
+            self._map_centered = True
+            self.map.set_center(*loc)
 
     def disconnect_all(self):
         if self._logging_active:
-            self.panel_fc1.stop_logging()
-            self.panel_fc2.stop_logging()
+            self.panel.stop_logging()
             self._logging_active = False
             self._log_btn.setText("Start logging")
-        self.panel_fc1.disconnect()
-        self.panel_fc2.disconnect()
+        self.panel.disconnect()
 
     def closeEvent(self, event):
+        self.fetcher.stop()
         self.disconnect_all()
         event.accept()
 
@@ -870,7 +1211,7 @@ class DualTelemetryHUD(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-    window = DualTelemetryHUD()
+    window = GroundStationWindow()
     window.show()
     sys.exit(app.exec())
 
