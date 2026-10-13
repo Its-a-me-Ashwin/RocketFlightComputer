@@ -8,6 +8,9 @@
 // From ARMED onward the FC stops listening — telemetry flows one way only.
 // Connect this board's USB serial to the ground station at 57600.
 // Packet format: preamble "RC", time_ms, alt_cm, ...
+// Bridge LED (GPIO13, onboard): slow 1 Hz blink = waiting for rocket (no telemetry
+//   >2 s); 40 ms flicker per packet from the rocket; 250 ms solid pulse when a
+//   command is forwarded over LoRa; 200 ms blink = LoRa init failed.
 // =============================================================================
 
 #include <SPI.h>
@@ -52,6 +55,13 @@ uint32_t packets_forwarded = 0;
 static char cmd_line[64];
 static uint8_t cmd_len = 0;
 
+// LED pattern state:
+//   - no telemetry for >2 s        -> slow 1 Hz blink ("waiting for rocket")
+//   - each packet from the rocket  -> 40 ms flicker
+//   - command forwarded over LoRa  -> 250 ms solid pulse
+static uint32_t last_telemetry_ms = 0;
+static uint32_t led_pulse_until_ms = 0;
+
 void send_command_over_lora(const char* cmd) {
   uint8_t len = (uint8_t)strlen(cmd);
   if (len == 0 || len > RH_RF95_MAX_MESSAGE_LEN) return;
@@ -75,6 +85,9 @@ void poll_serial_commands() {
     if (c == '\n') {
       cmd_line[cmd_len] = '\0';
       if (cmd_len > 0) {
+        Serial.print("[BRIDGE] >LoRa: ");
+        Serial.println(cmd_line);
+        led_pulse_until_ms = millis() + 250;  // solid pulse: "command sent"
         send_command_over_lora_reliable(cmd_line);
         cmd_len = 0;
       }
@@ -127,6 +140,7 @@ void setup() {
 void loop() {
   // Forward ground station commands (any text line) over LoRa
   poll_serial_commands();
+  uint32_t now = millis();
 
   // Receive packets from rocket: 28-byte "RC" telemetry → raw binary to Serial;
   // text replies (ACK/NACK/CFG/PONG) → line to Serial
@@ -145,14 +159,35 @@ void loop() {
       if (is_telemetry) {
         Serial.write(buf, len);
         packets_forwarded++;
-        digitalWrite(LED_BUILTIN, HIGH);
+        last_telemetry_ms = now;
+        led_pulse_until_ms = now + 40;  // short flicker per packet
       } else if (is_text && len > 0) {
         Serial.write(buf, len);
         Serial.write('\n');
+        led_pulse_until_ms = now + 40;
       }
     }
+  }
+
+  // LED pattern: pulse (command/packet) > 1 Hz blink when no telemetry >2 s > off
+  if (now < led_pulse_until_ms) {
+    digitalWrite(LED_BUILTIN, HIGH);
+  } else if (now - last_telemetry_ms > 2000) {
+    digitalWrite(LED_BUILTIN, (now % 1000) < 500);
   } else {
     digitalWrite(LED_BUILTIN, LOW);
+  }
+
+  // Link stats to the ground station every 5 s (packets + last RSSI)
+  static uint32_t last_stats_ms = 0;
+  static int16_t last_rssi = 0;
+  if (packets_forwarded > 0) last_rssi = rf95.lastRssi();
+  if (now - last_stats_ms >= 5000) {
+    last_stats_ms = now;
+    Serial.print("[BRIDGE] tele pkts=");
+    Serial.print(packets_forwarded);
+    Serial.print(" last RSSI=");
+    Serial.println(last_rssi);
   }
   delay(1);
 }

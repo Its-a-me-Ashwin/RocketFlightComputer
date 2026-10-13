@@ -7,6 +7,10 @@
 // GPS: UART0 on GP0 (TX) / GP1 (RX), 9600 baud — lat/lon in telemetry when fix valid; if lost, send sentinel and continue
 // ARM/DISARM: USB Serial + LoRa (TDD two-way until ARMED; one-way rocket→ground from ARMED)
 // Settings: SET/CFG?/SAVECFG text commands over USB or LoRa (READY/INIT only), persisted to flash
+// Telemetry: 1 Hz beacon from power-up (fields 0 pre-cal), 10 Hz once calibrated
+// FC LED (GPIO13, onboard): READY/CALIBRATING = 1 Hz blink, INIT = 2-burst, ARMED = 4 Hz blink,
+//       BOOST = solid, APOGEE/DROGUE = 3-burst, MAIN/FINISHED = 4-burst/heartbeat,
+//       + 150 ms solid flash whenever a LoRa command is received
 // Pins: I2C SDA=2, SCL=3; LoRa CS=16, INT=21, RST=17
 //       Pyro: GP9=MAIN, GP10=DROGUE, GP12=AIRSTART
 // =============================================================================
@@ -288,6 +292,7 @@ bool main_marked   = false;
 float P_at_main_descent_start = 0.0f;
 uint32_t ground_stable_start_ms = 0;
 uint32_t alt_near_ground_start_ms = 0;
+uint32_t lora_cmd_flash_until_ms = 0;  // LED override: solid while a LoRa command was just received
 
 // ---------------- ESTIMATOR ----------------
 float alt_f = 0.0f, alt_prev = 0.0f, v_baro = 0.0f, v_est = 0.0f;
@@ -539,6 +544,9 @@ void handle_lora_command() {
   uint8_t len = sizeof(buf);
   if (!rf95.recv(buf, &len)) return;
   if (len < sizeof(buf)) buf[len] = '\0'; else buf[sizeof(buf) - 1] = '\0';
+  lora_cmd_flash_until_ms = millis() + 150;  // visible "heard the ground" blink
+  Serial.print("[LORA RX] ");
+  Serial.println(reinterpret_cast<const char*>(buf));
   dispatch_command(reinterpret_cast<char*>(buf), ReplyChannel::LORA);
 }
 // ---------------- SENSOR INIT (called on START from READY; LoRa already inited in setup) ----------------
@@ -757,6 +765,8 @@ LedPattern pattern_for_state(bool calibrated, FlightState s, bool armed_flag) {
   }
 }
 void led_update(uint32_t now_ms, LedPattern pat) {
+  // Solid override: brief flash whenever a LoRa command arrives (any state pattern)
+  if (now_ms < lora_cmd_flash_until_ms) { led_write(true); return; }
   static constexpr uint16_t BLIP_ON_MS = 80, BLIP_OFF_MS = 120, BURST_GAP_MS = 1200;
   static uint32_t last_ms = 0;
   static bool led_on = false;
@@ -858,9 +868,11 @@ void loop() {
   LedPattern pat = pattern_for_state(calibrated, flight_state, armed);
   led_update(now, pat);
 
-  // Telemetry at 10 Hz when calibrated (same as FC2)
+  // Telemetry: 10 Hz in flight, 1 Hz pre-calibration beacon so the ground
+  // can see the link and FC state from power-up (fields are just 0 pre-cal)
   static uint32_t last_tel_ms = 0;
-  if (calibrated && (now - last_tel_ms >= 100)) {
+  uint32_t tele_period_ms = calibrated ? 100u : 1000u;
+  if (now - last_tel_ms >= tele_period_ms) {
     last_tel_ms = now;
     send_telemetry(now);
   }
