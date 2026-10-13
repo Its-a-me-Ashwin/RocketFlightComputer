@@ -8,9 +8,9 @@
 // From ARMED onward the FC stops listening — telemetry flows one way only.
 // Connect this board's USB serial to the ground station at 57600.
 // Packet format: preamble "RC", time_ms, alt_cm, ...
-// Bridge LED (GPIO13, onboard): slow 1 Hz blink = waiting for rocket (no telemetry
-//   >2 s); 40 ms flicker per packet from the rocket; 250 ms solid pulse when a
-//   command is forwarded over LoRa; 200 ms blink = LoRa init failed.
+// Bridge LED (GP13, onboard red): slow 1 Hz blink = waiting for rocket (no telemetry
+//   >2 s); SOLID = link established (telemetry flowing); LED blinks off for 200 ms
+//   while a command is being forwarded over LoRa; 200 ms blink loop = LoRa init failed.
 // =============================================================================
 
 #include <SPI.h>
@@ -19,6 +19,11 @@
 #ifndef LED_BUILTIN
 #define LED_BUILTIN 25
 #endif
+// Feather RP2040 onboard red LED is GP13 — force it: some "Feather RP2040 RFM"
+// board variants don't define LED_BUILTIN, and the 25 fallback is an RFM95 DIO
+// pin (LED appears dead).
+#undef LED_BUILTIN
+#define LED_BUILTIN 13
 
 // LoRa pins (Feather RP2040 RFM95)
 // IMPORTANT: SPI pins are set explicitly in setup() — a wrong IDE board variant
@@ -62,11 +67,11 @@ static char cmd_line[64];
 static uint8_t cmd_len = 0;
 
 // LED pattern state:
-//   - no telemetry for >2 s        -> slow 1 Hz blink ("waiting for rocket")
-//   - each packet from the rocket  -> 40 ms flicker
-//   - command forwarded over LoRa  -> 250 ms solid pulse
+//   - no telemetry for >2 s       -> slow 1 Hz blink ("waiting for rocket")
+//   - telemetry flowing           -> SOLID (link established)
+//   - command forwarded over LoRa -> LED off for 200 ms (blink while sending)
 static uint32_t last_telemetry_ms = 0;
-static uint32_t led_pulse_until_ms = 0;
+static uint32_t led_cmd_off_until_ms = 0;
 
 // TX-done wait with timeout: a dead/misconfigured radio must never hang the bridge
 static bool wait_tx_done(uint32_t timeout_ms) {
@@ -103,7 +108,7 @@ void poll_serial_commands() {
       if (cmd_len > 0) {
         Serial.print("[BRIDGE] >LoRa: ");
         Serial.println(cmd_line);
-        led_pulse_until_ms = millis() + 250;  // solid pulse: "command sent"
+        led_cmd_off_until_ms = millis() + 200;  // blink-off: "command being sent"
         send_command_over_lora_reliable(cmd_line);
         cmd_len = 0;
       }
@@ -181,22 +186,20 @@ void loop() {
         Serial.write(buf, len);
         packets_forwarded++;
         last_telemetry_ms = now;
-        led_pulse_until_ms = now + 40;  // short flicker per packet
       } else if (is_text && len > 0) {
         Serial.write(buf, len);
         Serial.write('\n');
-        led_pulse_until_ms = now + 40;
       }
     }
   }
 
-  // LED pattern: pulse (command/packet) > 1 Hz blink when no telemetry >2 s > off
-  if (now < led_pulse_until_ms) {
-    digitalWrite(LED_BUILTIN, HIGH);
+  // LED: blink-off during command TX > slow blink when no telemetry >2 s > solid = link up
+  if (now < led_cmd_off_until_ms) {
+    digitalWrite(LED_BUILTIN, LOW);
   } else if (now - last_telemetry_ms > 2000) {
     digitalWrite(LED_BUILTIN, (now % 1000) < 500);
   } else {
-    digitalWrite(LED_BUILTIN, LOW);
+    digitalWrite(LED_BUILTIN, HIGH);
   }
 
   // Link stats to the ground station every 5 s (packets + last RSSI)

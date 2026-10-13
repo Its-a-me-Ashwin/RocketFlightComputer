@@ -480,6 +480,16 @@ class TelemetryPanel(QFrame):
         self._cfg_dirty = False    # reader thread signals update_ui to refresh fields
         self._cfg_fields = {}      # key -> QLineEdit
 
+        # Async port refresh / connect (comports() and port open can block on Windows)
+        self._ports_lock = threading.Lock()
+        self._ports_pending = None
+        self._ports_refreshing = False
+        self._conn_lock = threading.Lock()
+        self._conn_result = None   # serial.Serial or Exception
+        self._connecting = False
+        self._conn_desc = ""
+        self._want_disconnect = False
+
         # COM port on its own line
         port_row = QHBoxLayout()
         port_row.addWidget(QLabel("COM Port:"))
@@ -631,12 +641,33 @@ class TelemetryPanel(QFrame):
         self._refresh_ports()
 
     def _refresh_ports(self):
-        ports = get_serial_ports()
+        """Async: list_ports.comports() can block for seconds on Windows — never on the GUI thread."""
+        if self._ports_refreshing:
+            return
+        self._ports_refreshing = True
+
+        def worker():
+            try:
+                ports = get_serial_ports()
+            except Exception:
+                ports = []
+            with self._ports_lock:
+                self._ports_pending = ports
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_pending_ports(self):
+        with self._ports_lock:
+            ports = self._ports_pending
+            self._ports_pending = None
+        if ports is None:
+            return
+        self._ports_refreshing = False
         current = self.port_combo.currentText()
         self.port_combo.clear()
         disp_list = [disp for _, disp in ports]
         self.port_combo.addItems(disp_list)
-        if disp_list and not current and ports:
+        if disp_list and not current:
             self.port_combo.setCurrentIndex(0)
         elif current in disp_list:
             self.port_combo.setCurrentText(current)
@@ -656,12 +687,46 @@ class TelemetryPanel(QFrame):
         except ValueError:
             QMessageBox.critical(self, "Invalid baud", "Baud must be an integer.")
             return
-        try:
-            self.ser = serial.Serial(device, baudrate=baud, timeout=1.0)
-        except Exception as e:
-            QMessageBox.critical(self, "Connection error", f"Could not open {device} @ {baud}:\n{e}")
+        if self._connecting or (self.ser is not None and self.ser.is_open):
             return
-        self._status_text = f"Connected {device} @ {baud}"
+        self._connecting = True
+        self._want_disconnect = False
+        self._conn_desc = f"{device} @ {baud}"
+        self._status_text = f"Connecting {self._conn_desc}..."
+
+        def worker():
+            try:
+                ser = serial.Serial(device, baudrate=baud, timeout=1.0)
+                res = ser
+            except Exception as e:
+                res = e
+            with self._conn_lock:
+                self._conn_result = res
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_pending_connection(self):
+        """Finish an async connect() on the GUI thread when the port open returns."""
+        with self._conn_lock:
+            res = self._conn_result
+            self._conn_result = None
+        if res is None:
+            return
+        self._connecting = False
+        if self._want_disconnect:
+            self._want_disconnect = False
+            if not isinstance(res, Exception):
+                try:
+                    res.close()
+                except Exception:
+                    pass
+            return
+        if isinstance(res, Exception):
+            QMessageBox.critical(self, "Connection error", f"Could not open {self._conn_desc}:\n{res}")
+            self._status_text = "Disconnected"
+            return
+        self.ser = res
+        self._status_text = f"Connected {self._conn_desc}"
         self.connect_btn.setEnabled(False)
         self.disconnect_btn.setEnabled(True)
         self.start_btn.setEnabled(True)
@@ -672,12 +737,14 @@ class TelemetryPanel(QFrame):
         self.connection_lost = False
         self._thread = threading.Thread(target=self._reader_loop, daemon=True)
         self._thread.start()
-        # Auto-read FC settings over the two-way link (LoRa bridge panel only;
-        # legacy direct-serial panels don't answer CFG?)
+        # Auto-read FC settings over the two-way link (LoRa bridge panel)
         if "LoRa" in self.title:
             QTimer.singleShot(800, self.read_settings)
 
     def disconnect(self):
+        if self._connecting:
+            self._want_disconnect = True
+            return
         self._stop.set()
         if self.ser is not None:
             try:
@@ -824,15 +891,19 @@ class TelemetryPanel(QFrame):
             with self._ack_lock:
                 self._ack_lines.append(line)
                 self._ack_event.set()
+        elif line == "CFG END":
+            with self._cfg_lock:
+                self._cfg_dirty = True
+            # also feed the ACK queue: read_settings waits for this terminator
+            with self._ack_lock:
+                self._ack_lines.append(line)
+                self._ack_event.set()
         elif line.startswith("CFG "):
             parts = line.split(" ", 2)
             if len(parts) == 3:
                 with self._cfg_lock:
                     self._cfg_values[parts[1]] = parts[2]
                     self._cfg_dirty = True
-        elif line == "CFG END":
-            with self._cfg_lock:
-                self._cfg_dirty = True
         # anything else (bridge banner, etc.) is ignored
 
     # ---------------- Commands (ACK-aware, two-way until FC is ARMED) ----------------
@@ -870,7 +941,8 @@ class TelemetryPanel(QFrame):
                 return False, str(e)
             resp = self._wait_for_ack(expect_prefix=expect_prefix, timeout=timeout)
             if resp is not None:
-                return (resp.startswith("ACK") or resp == "PONG"), resp
+                ok = resp.startswith("ACK") or resp == "PONG" or resp.startswith(expect_prefix)
+                return ok, resp
         return False, "no reply (timeout)"
 
     def _run_cmd(self, cmd, label):
@@ -978,6 +1050,9 @@ class TelemetryPanel(QFrame):
         threading.Thread(target=worker, daemon=True).start()
 
     def update_ui(self):
+        # Apply results of async port refresh / connect (workers never touch widgets)
+        self._apply_pending_ports()
+        self._apply_pending_connection()
         status_display = self._status_text
         # FC (LoRa bridge) sends telemetry only after START; hint when connected but no data
         if "LoRa" in self.title and self.ser is not None and self.ser.is_open and self.last_packet_time is None:

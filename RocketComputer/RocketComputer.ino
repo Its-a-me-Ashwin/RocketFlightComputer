@@ -8,10 +8,9 @@
 // ARM/DISARM: USB Serial + LoRa (TDD two-way until ARMED; one-way rocket→ground from ARMED)
 // Settings: SET/CFG?/SAVECFG text commands over USB or LoRa (READY/INIT only), persisted to flash
 // Telemetry: 1 Hz beacon from power-up (fields 0 pre-cal), 10 Hz once calibrated
-// FC LED (GPIO13, onboard): READY/CALIBRATING = 1 Hz blink, INIT = 2-burst, ARMED = 4 Hz blink,
-//       BOOST = solid, APOGEE/DROGUE = 3-burst, MAIN/FINISHED = 4-burst/heartbeat,
-//       + 150 ms solid flash whenever a LoRa command is received;
-//       rapid strobe (8 Hz) = LoRa init failed (check board variant / wiring)
+// FC LED (GP13, onboard red): 1 Hz blink = waiting for link; SOLID = link up (heard
+//       the ground in the last 3 s); short flash = LoRa RX/TX activity; rapid blink
+//       = ARMED onward; rapid strobe = LoRa init failed (board variant / wiring)
 // Pins: I2C SDA=2, SCL=3; LoRa CS=16, INT=21, RST=17
 //       Pyro: GP9=MAIN, GP10=DROGUE, GP12=AIRSTART
 // =============================================================================
@@ -33,6 +32,11 @@
 #ifndef LED_BUILTIN
 #define LED_BUILTIN 25
 #endif
+// Feather RP2040 onboard red LED is GP13 — force it: some "Feather RP2040 RFM"
+// board variants don't define LED_BUILTIN, and the 25 fallback is an RFM95 DIO
+// pin (LED appears dead).
+#undef LED_BUILTIN
+#define LED_BUILTIN 13
 
 enum class FlightState : uint8_t;
 enum class LedPattern  : uint8_t;
@@ -299,6 +303,7 @@ float P_at_main_descent_start = 0.0f;
 uint32_t ground_stable_start_ms = 0;
 uint32_t alt_near_ground_start_ms = 0;
 uint32_t lora_cmd_flash_until_ms = 0;  // LED override: solid while a LoRa command was just received
+uint32_t last_lora_rx_ms = 0;          // last time the FC heard the ground over LoRa (link-up indicator)
 
 // ---------------- ESTIMATOR ----------------
 float alt_f = 0.0f, alt_prev = 0.0f, v_baro = 0.0f, v_est = 0.0f;
@@ -567,6 +572,7 @@ void handle_lora_command() {
   if (!rf95.recv(buf, &len)) return;
   if (len < sizeof(buf)) buf[len] = '\0'; else buf[sizeof(buf) - 1] = '\0';
   lora_cmd_flash_until_ms = millis() + 150;  // visible "heard the ground" blink
+  last_lora_rx_ms = millis();                // link-up indicator (LED solid when recent)
   Serial.print("[LORA RX] ");
   Serial.println(reinterpret_cast<const char*>(buf));
   dispatch_command(reinterpret_cast<char*>(buf), ReplyChannel::LORA);
@@ -767,7 +773,7 @@ void update_state_machine(uint32_t now_ms, bool baro_ok, float a_net_mag, float 
 }
 
 // ---------------- LED ----------------
-enum class LedPattern : uint8_t { OFF = 0, SOLID, BLINK_1HZ, BLINK_4HZ, BURST_2, BURST_3, BURST_4, HEARTBEAT, ERR_STROBE };
+enum class LedPattern : uint8_t { OFF = 0, SOLID, BLINK_1HZ, BLINK_4HZ, BLINK_8HZ, BURST_2, BURST_3, BURST_4, HEARTBEAT, ERR_STROBE };
 LedPattern pattern_for_state(bool calibrated, FlightState s, bool armed_flag) {
   (void)calibrated;
   (void)armed_flag;
@@ -801,6 +807,7 @@ void led_update(uint32_t now_ms, LedPattern pat) {
     case LedPattern::SOLID: led_write(true); return;
     case LedPattern::BLINK_1HZ: if (now_ms - last_ms >= 500) { last_ms = now_ms; led_on = !led_on; led_write(led_on); } return;
     case LedPattern::BLINK_4HZ: if (now_ms - last_ms >= 125) { last_ms = now_ms; led_on = !led_on; led_write(led_on); } return;
+    case LedPattern::BLINK_8HZ: if (now_ms - last_ms >= 62)  { last_ms = now_ms; led_on = !led_on; led_write(led_on); } return;
     case LedPattern::ERR_STROBE: if (now_ms - last_ms >= 62) { last_ms = now_ms; led_on = !led_on; led_write(led_on); } return;
     case LedPattern::HEARTBEAT: led_write((now_ms % 1000) < 60); return;
     case LedPattern::BURST_2: case LedPattern::BURST_3: case LedPattern::BURST_4: {
@@ -849,6 +856,7 @@ void send_telemetry(uint32_t now_ms) {
   if (!radio_ok) return;
   rf95.send(reinterpret_cast<const uint8_t*>(&pkt), sizeof(pkt));
   wait_tx_done(200);  // timeout-guarded: never hang the loop on a dead radio
+  lora_cmd_flash_until_ms = now_ms + 30;  // blink while sending telemetry
   // Two-way (TDD) until ARMED: listen for commands between telemetry bursts.
   // From ARMED onward: one-way only (rocket → ground), no RX.
   if (is_two_way_state()) rf95.setModeRx(); else rf95.setModeIdle();
@@ -889,8 +897,12 @@ void loop() {
   // GPS poll every loop (non-blocking); if GPS is lost, we just get no fix — flight logic unchanged
   gps_poll();
 
-  LedPattern pat = pattern_for_state(calibrated, flight_state, armed);
-  if (!radio_ok) pat = LedPattern::ERR_STROBE;  // rapid strobe = radio init failed
+  // LED: strobe = radio init failed; rapid blink = ARMED onward; solid = link up
+  // (heard the ground over LoRa in the last 3 s); 1 Hz blink = waiting for link
+  LedPattern pat;
+  if (!radio_ok) pat = LedPattern::ERR_STROBE;
+  else if (flight_state >= FlightState::ARMED) pat = LedPattern::BLINK_8HZ;
+  else pat = (now - last_lora_rx_ms < 3000) ? LedPattern::SOLID : LedPattern::BLINK_1HZ;
   led_update(now, pat);
 
   // Telemetry: 10 Hz in flight, 1 Hz pre-calibration beacon so the ground
