@@ -21,9 +21,15 @@
 #endif
 
 // LoRa pins (Feather RP2040 RFM95)
+// IMPORTANT: SPI pins are set explicitly in setup() — a wrong IDE board variant
+// (e.g. plain "Raspberry Pi Pico") maps MISO to GP16 = RFM95 CS and the radio
+// never works. Select "Adafruit Feather RP2040" (earlephilhower core).
 #define RFM95_CS   16
 #define RFM95_INT  21
 #define RFM95_RST  17
+#define RFM95_SCK  18
+#define RFM95_MOSI 19
+#define RFM95_MISO 20
 #define RF95_FREQ  915.0
 
 // 28-byte telemetry packet (must match FC)
@@ -62,11 +68,21 @@ static uint8_t cmd_len = 0;
 static uint32_t last_telemetry_ms = 0;
 static uint32_t led_pulse_until_ms = 0;
 
+// TX-done wait with timeout: a dead/misconfigured radio must never hang the bridge
+static bool wait_tx_done(uint32_t timeout_ms) {
+  uint32_t t0 = millis();
+  while (rf95.mode() == RHGenericDriver::RHModeTx) {
+    if (millis() - t0 >= timeout_ms) return false;
+    delay(1);
+  }
+  return true;
+}
+
 void send_command_over_lora(const char* cmd) {
   uint8_t len = (uint8_t)strlen(cmd);
   if (len == 0 || len > RH_RF95_MAX_MESSAGE_LEN) return;
   rf95.send((const uint8_t*)cmd, len);
-  rf95.waitPacketSent();
+  wait_tx_done(200);
   rf95.setModeRx();
 }
 
@@ -106,7 +122,12 @@ void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
 
-  Serial.println("LoRa Bridge (FC) starting — half-duplex: RX telemetry, TX START/ARM...");
+  // Pin SPI explicitly: wrong board variant (e.g. plain Pico) maps MISO to GP16 = RFM95 CS
+  SPI.setSCK(RFM95_SCK);
+  SPI.setTX(RFM95_MOSI);
+  SPI.setRX(RFM95_MISO);
+
+  Serial.println("LoRa Bridge v2.1 (FC) starting — half-duplex: RX telemetry, TX commands...");
 
   pinMode(RFM95_RST, OUTPUT);
   digitalWrite(RFM95_RST, LOW);

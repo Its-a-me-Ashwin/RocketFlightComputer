@@ -10,7 +10,8 @@
 // Telemetry: 1 Hz beacon from power-up (fields 0 pre-cal), 10 Hz once calibrated
 // FC LED (GPIO13, onboard): READY/CALIBRATING = 1 Hz blink, INIT = 2-burst, ARMED = 4 Hz blink,
 //       BOOST = solid, APOGEE/DROGUE = 3-burst, MAIN/FINISHED = 4-burst/heartbeat,
-//       + 150 ms solid flash whenever a LoRa command is received
+//       + 150 ms solid flash whenever a LoRa command is received;
+//       rapid strobe (8 Hz) = LoRa init failed (check board variant / wiring)
 // Pins: I2C SDA=2, SCL=3; LoRa CS=16, INT=21, RST=17
 //       Pyro: GP9=MAIN, GP10=DROGUE, GP12=AIRSTART
 // =============================================================================
@@ -71,12 +72,16 @@ static constexpr uint8_t LSM6DSOX_ADDR = 0x6A;
 
 // ---- LoRa RFM95 (Feather inbuilt) ----
 // One radio = half-duplex only (cannot TX and RX simultaneously on the same channel).
-// "Pseudo full duplex" = time-division: e.g. FC listens in short windows while ground sends
-// queued commands in those windows — needs shared schedule (e.g. slot index in telemetry)
-// and tolerates clock drift; not implemented here — bridge repeats rare commands instead.
+// Commands are repeated by the bridge and ACK'd by the FC instead.
+// IMPORTANT: SPI pins are set explicitly below — if the IDE board variant is wrong
+// (e.g. plain "Raspberry Pi Pico"), the default MISO lands on GP16 = RFM95 CS and
+// the radio never works. Select "Adafruit Feather RP2040" (earlephilhower core).
 static constexpr uint8_t RFM95_CS   = 16;
 static constexpr uint8_t RFM95_INT  = 21;
 static constexpr uint8_t RFM95_RST  = 17;
+static constexpr uint8_t RFM95_SCK  = 18;   // Feather SPI: SCK=18, MOSI=19, MISO=20
+static constexpr uint8_t RFM95_MOSI = 19;
+static constexpr uint8_t RFM95_MISO = 20;
 static constexpr float  RF95_FREQ   = 915.0f;
 
 // ---- GPS (UART0: MCU GP0=TX, GP1=RX) ----
@@ -257,6 +262,7 @@ Adafruit_BMP3XX bmp;
 Adafruit_LSM6DSOX imu;
 RH_RF95 rf95(RFM95_CS, RFM95_INT);
 TinyGPSPlus gps;
+bool radio_ok = false;  // false if LoRa init failed — all radio ops guarded so the FC never hangs
 
 // ---------------- BASELINES ----------------
 bool calibrated = false;
@@ -377,6 +383,11 @@ void estimator_update(uint32_t now_ms, float alt_m) {
 
 // ---------------- RADIO INIT (called from setup so we can receive START/ARM over LoRa before sensors) ----------------
 void init_radio_only() {
+  // Pin SPI explicitly: wrong board variant (e.g. plain Pico) maps MISO to GP16 = RFM95 CS
+  SPI.setSCK(RFM95_SCK);
+  SPI.setTX(RFM95_MOSI);
+  SPI.setRX(RFM95_MISO);
+
   pinMode(RFM95_RST, OUTPUT);
   digitalWrite(RFM95_RST, HIGH);
   delay(10);
@@ -385,7 +396,7 @@ void init_radio_only() {
   digitalWrite(RFM95_RST, HIGH);
   delay(10);
   if (!rf95.init()) {
-    Serial.println("LoRa init FAILED");
+    Serial.println("LoRa init FAILED — check board variant is 'Adafruit Feather RP2040' and radio wiring");
     return;
   }
   if (!rf95.setFrequency(RF95_FREQ)) {
@@ -394,7 +405,18 @@ void init_radio_only() {
   }
   rf95.setTxPower(13, false);
   rf95.setModeRx();
-  Serial.println("LoRa OK (RX for START/ARM pre-boost)");
+  radio_ok = true;
+  Serial.println("LoRa OK (RX for commands pre-ARMED)");
+}
+
+// TX-done wait with timeout: a dead/misconfigured radio must never hang the FC
+static bool wait_tx_done(uint32_t timeout_ms) {
+  uint32_t t0 = millis();
+  while (rf95.mode() == RHGenericDriver::RHModeTx) {
+    if (millis() - t0 >= timeout_ms) return false;
+    delay(1);
+  }
+  return true;
 }
 
 bool is_two_way_state() {
@@ -408,9 +430,9 @@ enum class ReplyChannel : uint8_t { USB = 0, LORA = 1 };
 
 static void reply_text(ReplyChannel ch, const char* msg) {
   Serial.println(msg);
-  if (ch == ReplyChannel::LORA) {
+  if (ch == ReplyChannel::LORA && radio_ok) {
     rf95.send(reinterpret_cast<const uint8_t*>(msg), strlen(msg));
-    rf95.waitPacketSent();
+    wait_tx_done(200);
     if (is_two_way_state()) rf95.setModeRx(); else rf95.setModeIdle();
   }
 }
@@ -538,7 +560,7 @@ void handle_serial_command() {
 
 // Process commands received over LoRa (two-way states only: READY/CALIBRATING/INIT)
 void handle_lora_command() {
-  if (!is_two_way_state()) return;
+  if (!radio_ok || !is_two_way_state()) return;
   if (!rf95.available()) return;
   uint8_t buf[80];
   uint8_t len = sizeof(buf);
@@ -745,7 +767,7 @@ void update_state_machine(uint32_t now_ms, bool baro_ok, float a_net_mag, float 
 }
 
 // ---------------- LED ----------------
-enum class LedPattern : uint8_t { OFF = 0, SOLID, BLINK_1HZ, BLINK_4HZ, BURST_2, BURST_3, BURST_4, HEARTBEAT };
+enum class LedPattern : uint8_t { OFF = 0, SOLID, BLINK_1HZ, BLINK_4HZ, BURST_2, BURST_3, BURST_4, HEARTBEAT, ERR_STROBE };
 LedPattern pattern_for_state(bool calibrated, FlightState s, bool armed_flag) {
   (void)calibrated;
   (void)armed_flag;
@@ -779,6 +801,7 @@ void led_update(uint32_t now_ms, LedPattern pat) {
     case LedPattern::SOLID: led_write(true); return;
     case LedPattern::BLINK_1HZ: if (now_ms - last_ms >= 500) { last_ms = now_ms; led_on = !led_on; led_write(led_on); } return;
     case LedPattern::BLINK_4HZ: if (now_ms - last_ms >= 125) { last_ms = now_ms; led_on = !led_on; led_write(led_on); } return;
+    case LedPattern::ERR_STROBE: if (now_ms - last_ms >= 62) { last_ms = now_ms; led_on = !led_on; led_write(led_on); } return;
     case LedPattern::HEARTBEAT: led_write((now_ms % 1000) < 60); return;
     case LedPattern::BURST_2: case LedPattern::BURST_3: case LedPattern::BURST_4: {
       uint8_t bursts = (pat == LedPattern::BURST_2) ? 2 : (pat == LedPattern::BURST_3) ? 3 : 4;
@@ -823,8 +846,9 @@ void send_telemetry(uint32_t now_ms) {
   pkt.pitch_centi = pc;
   pkt.yaw_centi = yc;
   pkt.checksum = telemetry_checksum(pkt);
+  if (!radio_ok) return;
   rf95.send(reinterpret_cast<const uint8_t*>(&pkt), sizeof(pkt));
-  rf95.waitPacketSent();
+  wait_tx_done(200);  // timeout-guarded: never hang the loop on a dead radio
   // Two-way (TDD) until ARMED: listen for commands between telemetry bursts.
   // From ARMED onward: one-way only (rocket → ground), no RX.
   if (is_two_way_state()) rf95.setModeRx(); else rf95.setModeIdle();
@@ -836,7 +860,7 @@ void setup() {
   unsigned long t0 = millis();
   while (!Serial && millis() - t0 < 1500) delay(10);
 
-  Serial.println("\n=== Rocket FC: BMP390 + LSM6DSOX + LoRa (915 MHz) + GPS (UART0 GP0/GP1) ===");
+  Serial.println("\n=== Rocket FC v2.1: BMP390 + LSM6DSOX + LoRa (915 MHz) + GPS (UART0 GP0/GP1) ===");
   Serial.println("State READY. Send START via USB Serial or LoRa to begin init and calibration.");
   Serial.println("ARM only via explicit ARM command (no auto-arm). ARMED idle timeout -> INIT (send ARM to re-arm). From ARMED: one-way LoRa.");
   load_config();
@@ -866,6 +890,7 @@ void loop() {
   gps_poll();
 
   LedPattern pat = pattern_for_state(calibrated, flight_state, armed);
+  if (!radio_ok) pat = LedPattern::ERR_STROBE;  // rapid strobe = radio init failed
   led_update(now, pat);
 
   // Telemetry: 10 Hz in flight, 1 Hz pre-calibration beacon so the ground
