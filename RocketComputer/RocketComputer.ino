@@ -31,12 +31,16 @@
 
 enum class FlightState : uint8_t;
 enum class LedPattern  : uint8_t;
+enum class CfgType : uint8_t;
+enum class ReplyChannel : uint8_t;
 
 const char* stateToString(FlightState s);
 LedPattern pattern_for_state(bool calibrated, FlightState s, bool armed_flag);
 void led_update(uint32_t now_ms, LedPattern pat);
 
 struct TelemetryPacket;
+struct FlightConfig;
+struct CfgKey;
 uint8_t telemetry_checksum(const TelemetryPacket &pkt);
 void send_telemetry(uint32_t now_ms);
 bool init_sensors();
@@ -46,6 +50,7 @@ void handle_lora_command();
 bool is_two_way_state();
 void load_config();
 bool save_config();
+void dispatch_command(char* line, ReplyChannel ch);
 void gps_setup_uart0();
 void gps_poll();
 
